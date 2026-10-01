@@ -166,13 +166,44 @@ def claimed_branches():
     return {str(r.get("branch") or "").strip() for r in supabase_users() if r.get("active", True) and str(r.get("branch") or "").strip() and r.get("role", "User") == "User"}
 
 def create_supabase_user(username, full_name, branch, password, role="User", must_change=False):
+    """Create an account. TEST currently has no public.app_users table, so fall back to the app's existing users.json store."""
     salt, digest = hash_password(password)
     payload = [{"username":username.strip(), "full_name":full_name.strip(), "branch":branch, "role":role, "password_salt":salt, "password_hash":digest, "active":True, "must_change_password":must_change, "updated_at":datetime.now().isoformat()}]
-    return _auth_sb_request("app_users", "POST", payload=payload)
+    try:
+        return _auth_sb_request("app_users", "POST", payload=payload)
+    except Exception as e:
+        if "PGRST205" not in str(e) and "Could not find the table 'public.app_users'" not in str(e):
+            raise
+        users = load_users()
+        clean = username.strip()
+        if clean in users:
+            raise RuntimeError("Username already exists.")
+        users[clean] = {
+            "full_name": full_name.strip() or clean,
+            "branch": branch,
+            "role": role,
+            "password_salt": salt,
+            "password_hash": digest,
+            "active": True,
+            "must_change_password": must_change
+        }
+        save_users(users)
+        return [dict(users[clean], username=clean)]
 
 def update_supabase_user(username, values):
     values = dict(values); values["updated_at"] = datetime.now().isoformat()
-    return _auth_sb_request("app_users", "PATCH", {"username":f"eq.{username}"}, values)
+    try:
+        return _auth_sb_request("app_users", "PATCH", {"username":f"eq.{username}"}, values)
+    except Exception as e:
+        if "PGRST205" not in str(e) and "Could not find the table 'public.app_users'" not in str(e):
+            raise
+        users = load_users()
+        if username not in users:
+            raise RuntimeError("User account not found.")
+        local_values = {k:v for k,v in values.items() if k != "updated_at"}
+        users[username].update(local_values)
+        save_users(users)
+        return [dict(users[username], username=username)]
 
 def activation_available_branches():
     """Load active branches without depending on functions defined later in the app."""
@@ -376,8 +407,13 @@ def admin_panel():
                     st.error(str(e))
 
     permanent = supabase_users()
+    using_local_accounts = not permanent
+    if using_local_accounts:
+        permanent = [dict(v, username=k) for k, v in load_users().items()]
     if permanent:
-        st.markdown("### Permanent Accounts")
+        st.markdown("### Accounts")
+        if using_local_accounts:
+            st.caption("TEST user accounts are currently using the app's existing local user store because public.app_users is not present in TEST Supabase.")
         st.dataframe(pd.DataFrame([{"Username":r.get("username"),"Name":r.get("full_name"),"Branch":r.get("branch"),"Role":r.get("role"),"Active":r.get("active",True),"Must Change Password":r.get("must_change_password",False)} for r in permanent]), use_container_width=True, hide_index=True)
         target = st.selectbox("Select Permanent User to Manage", [r.get("username") for r in permanent], key="perm_manage")
         selected = next(r for r in permanent if r.get("username") == target)
@@ -1833,7 +1869,14 @@ def super_orders():
                 # SQLite connection. Auditing inside `with db_conn()` locked the DB.
                 if not errors:
                     audit("ALLOCATION_EXCEL_UPLOADED",str(cyc.order_no))
-                    st.success("Uploaded allocation saved. The uploaded quantities now reflect as the Allocation / To Deliver for this order.")
+                    # IMPORTANT: the allocation editor is a stateful Streamlit widget.
+                    # After an Excel upload, its old widget state can otherwise redraw
+                    # the pre-upload quantities even though SQLite (and the DR) already
+                    # contain the newly uploaded allocation. Clear only the allocation
+                    # editor state and leave the delivery/DR workflow untouched.
+                    st.session_state[edit_key] = False
+                    st.session_state.pop(f"allocation_grid_{int(cyc.id)}", None)
+                    st.success("Uploaded allocation saved. The Allocation Preview will now reload from the saved uploaded quantities.")
                     st.rerun()
         except Exception as exc:
             st.error(f"Could not process or save this allocation file: {exc}")
