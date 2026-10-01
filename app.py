@@ -2925,9 +2925,10 @@ def render_daily_brew():
     st.markdown(f"""<div style='background:#FBF7F2;border:1px solid #E4D8CD;border-radius:16px;padding:18px 20px;margin:8px 0 18px 0'><b style='color:#3C271B'>☕ Kape Reminder of the Day</b><br><span style='color:#5A3F2D;font-size:1.05rem'>{daily_brew_message()}</span></div>""",unsafe_allow_html=True)
 
 # V13.1 role-aware navigation
+from warehouse_inventory import render_warehouse_inventory
 is_admin = current_role in ("Admin", "Super Admin")
 if is_admin:
-    admin_menu=["Dashboard","Orders","Stock Count Requests","Delivery Receipt Generator","Receiving & Variances","Deliveries","Transaction History","User Management"]
+    admin_menu=["Dashboard","Warehouse Inventory","Orders","Stock Count Requests","Delivery Receipt Generator","Receiving & Variances","Deliveries","Transaction History","User Management"]
     if current_role == "Super Admin": admin_menu.extend(["Database Backup", "Settings"])
     mode=st.sidebar.radio("System Menu",admin_menu)
     if mode=="Dashboard":
@@ -2939,6 +2940,7 @@ if is_admin:
             recv=c.execute("SELECT COUNT(*) FROM deliveries_v2 WHERE status='For Receiving'").fetchone()[0]
         a,b,c1=st.columns(3); a.metric("Order Requests",total); b.metric("Pending Branch Submissions",pending); c1.metric("For Receiving",recv)
         st.caption("Create an Order No. under Orders, select the category and branches, then send the request to staff.")
+    elif mode=="Warehouse Inventory": render_warehouse_inventory(current_user,current_role)
     elif mode=="Orders": super_orders()
     elif mode=="Stock Count Requests": stock_count_admin()
     elif mode=="Delivery Receipt Generator": render_dr_generator()
