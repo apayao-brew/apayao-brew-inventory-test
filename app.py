@@ -332,7 +332,11 @@ def login_screen():
         if record and record.get("active", True) and verify_password(password, record["password_salt"], record["password_hash"]):
             st.session_state["authenticated"] = True
             st.session_state["username"] = username
-            st.session_state["role"] = record.get("role", "User")
+            login_role = record.get("role", "User")
+            # TEST migration: the old separate Warehouse role is now the Admin role.
+            if login_role == "Warehouse":
+                login_role = "Admin"
+            st.session_state["role"] = login_role
             st.session_state["branch"] = record.get("branch", "")
             st.session_state["must_change_password"] = record.get("must_change_password", False)
             token = _make_login_token(username, record, hours=12)
@@ -380,14 +384,16 @@ def admin_panel():
     with st.expander("Create New User", expanded=False):
         new_user = st.text_input("New Username", key="admin_new_username")
         full_name = st.text_input("Name", key="admin_new_full_name")
-        new_role = st.selectbox("Role", ["User", "Warehouse", "Admin", "Super Admin"], key="admin_new_role")
-        if new_role == "Warehouse":
+        new_role = st.selectbox("Role", ["User", "Admin", "Super Admin"], key="admin_new_role")
+        if new_role == "Admin":
             branch_options = ["Buntun Warehouse", "Echague Warehouse", "Santa Maria Warehouse"]
             new_branch = st.selectbox("Assigned Warehouse", branch_options, key="admin_new_branch")
+        elif new_role == "Super Admin":
+            new_branch = "Main Store / All Branches"
+            st.caption("Super Admin has access to all warehouses.")
         else:
-            branch_options = ["Main Store / All Branches"] + available_branches()
-            default_branch = "Main Store / All Branches" if new_role in ("Admin", "Super Admin") else branch_options[0]
-            new_branch = st.selectbox("Branch", branch_options, index=branch_options.index(default_branch), key="admin_new_branch")
+            branch_options = available_branches()
+            new_branch = st.selectbox("Branch", branch_options, key="admin_new_branch")
         temp_pw = st.text_input("Temporary Password", type="password", key="admin_temp_pw")
         if st.button("Create User"):
             clean_user = new_user.strip()
@@ -437,8 +443,9 @@ def admin_panel():
                     log_activity(st.session_state["username"],"PASSWORD_RESET",target)
                     st.success("Password reset. User must change it on next login.")
         with c3:
-            roles=["User","Warehouse","Admin","Super Admin"]
-            role_now=selected.get("role","User") if selected.get("role","User") in roles else "User"
+            roles=["User","Admin","Super Admin"]
+            stored_role=selected.get("role","User")
+            role_now="Admin" if stored_role=="Warehouse" else (stored_role if stored_role in roles else "User")
             role_new=st.selectbox("Change Role",roles,index=roles.index(role_now),key=f"perm_role_{target}")
             if st.button("Update Role"):
                 if target == st.session_state["username"] and role_new != selected.get("role"):
@@ -447,17 +454,22 @@ def admin_panel():
                     update_supabase_user(target,{"role":role_new})
                     log_activity(st.session_state["username"],"ROLE_CHANGED",f"{target}: {role_new}")
                     st.rerun()
-        if selected.get("role") == "Warehouse":
+        selected_role = "Admin" if selected.get("role") == "Warehouse" else selected.get("role", "User")
+        if selected_role == "Admin":
             branch_options=["Buntun Warehouse", "Echague Warehouse", "Santa Maria Warehouse"]
             current_branch=selected.get("branch") or branch_options[0]
-            if current_branch not in branch_options: branch_options.append(current_branch)
+            if current_branch not in branch_options: current_branch=branch_options[0]
             assigned=st.selectbox("Assigned Warehouse",branch_options,index=branch_options.index(current_branch),key=f"perm_branch_{target}")
             update_assignment_label="Update Assigned Warehouse"
+        elif selected_role == "Super Admin":
+            assigned="Main Store / All Branches"
+            st.caption("Super Admin has access to all warehouses.")
+            update_assignment_label="Keep Super Admin Assignment"
         else:
-            branch_options=["Main Store / All Branches"]+available_branches()
-            current_branch=selected.get("branch") or "Main Store / All Branches"
-            if current_branch not in branch_options: branch_options.append(current_branch)
-            assigned=st.selectbox("Assigned Branch",branch_options,index=branch_options.index(current_branch),key=f"perm_branch_{target}")
+            branch_options=available_branches()
+            current_branch=selected.get("branch") or (branch_options[0] if branch_options else "")
+            if current_branch and current_branch not in branch_options: branch_options.append(current_branch)
+            assigned=st.selectbox("Assigned Branch",branch_options,index=branch_options.index(current_branch) if current_branch in branch_options else 0,key=f"perm_branch_{target}") if branch_options else ""
             update_assignment_label="Update Assigned Branch"
         if st.button(update_assignment_label):
             update_supabase_user(target,{"branch":assigned})
@@ -2995,7 +3007,7 @@ if is_admin:
             recv=c.execute("SELECT COUNT(*) FROM deliveries_v2 WHERE status='For Receiving'").fetchone()[0]
         a,b,c1=st.columns(3); a.metric("Order Requests",total); b.metric("Pending Branch Submissions",pending); c1.metric("For Receiving",recv)
         st.caption("Create an Order No. under Orders, select the category and branches, then send the request to staff.")
-    elif mode=="Warehouse Inventory": render_warehouse_inventory(current_user,current_role)
+    elif mode=="Warehouse Inventory": render_warehouse_inventory(current_user,current_role, st.session_state.get("branch", ""))
     elif mode=="Orders": super_orders()
     elif mode=="Stock Count Requests": stock_count_admin()
     elif mode=="Delivery Receipt Generator": render_dr_generator()
@@ -3005,14 +3017,6 @@ if is_admin:
     elif mode=="User Management": admin_panel()
     elif mode=="Database Backup": database_backup()
     elif mode=="Settings": branch_management()
-elif current_role == "Warehouse":
-    mode=st.sidebar.radio("Warehouse Menu",["Dashboard","Warehouse Inventory"])
-    if mode=="Dashboard":
-        st.markdown("## Warehouse Dashboard")
-        render_daily_brew()
-        st.info("Warehouse preparation lists will appear here after Super Admin sends an allocation to warehouses.")
-    elif mode=="Warehouse Inventory":
-        render_warehouse_inventory(current_user,current_role)
 else:
     mode=st.sidebar.radio("Branch Menu",["Dashboard","Order Requests","Stock Count","My Orders","Receive Delivery","Variances","History"])
     if mode=="Dashboard":

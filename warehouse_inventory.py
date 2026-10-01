@@ -79,7 +79,7 @@ def _template(warehouse_name):
         frame.to_excel(writer,index=False,sheet_name='Receiving')
     return buf.getvalue()
 
-def render_warehouse_inventory(username, role):
+def render_warehouse_inventory(username, role, assigned_warehouse=""):
     if role not in ('Admin','Super Admin'):
         st.error('Warehouse Inventory is available to Admin and Super Admin only.')
         return
@@ -97,7 +97,18 @@ def render_warehouse_inventory(username, role):
         return
 
     preferred = [w for w in ('Buntun','Echague','Santa Maria') if w in warehouse_map]
-    warehouse_name = st.selectbox('Warehouse', preferred, key='wh_warehouse')
+    if role == 'Admin':
+        # Admin is the warehouse account. It is locked to one assigned warehouse.
+        normalized = str(assigned_warehouse or '').strip()
+        if normalized.endswith(' Warehouse'):
+            normalized = normalized[:-10].strip()
+        if normalized not in warehouse_map:
+            st.error('This Admin account has no valid Assigned Warehouse. Ask Super Admin to assign Buntun, Echague, or Santa Maria in User Management.')
+            return
+        warehouse_name = normalized
+        st.text_input('Assigned Warehouse', value=warehouse_name, disabled=True, key='wh_assigned_warehouse')
+    else:
+        warehouse_name = st.selectbox('Warehouse', preferred, key='wh_warehouse')
     warehouse_id = warehouse_map[warehouse_name]
     category = st.selectbox('Category', WAREHOUSE_CATEGORIES[warehouse_name], key='wh_category_v2')
 
