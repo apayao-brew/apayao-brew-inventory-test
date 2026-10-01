@@ -350,9 +350,13 @@ def admin_panel():
         new_user = st.text_input("New Username", key="admin_new_username")
         full_name = st.text_input("Name", key="admin_new_full_name")
         new_role = st.selectbox("Role", ["User", "Warehouse", "Admin", "Super Admin"], key="admin_new_role")
-        branch_options = ["Main Store / All Branches"] + available_branches()
-        default_branch = "Main Store / All Branches" if new_role in ("Admin", "Super Admin") else branch_options[0]
-        new_branch = st.selectbox("Branch", branch_options, index=branch_options.index(default_branch), key="admin_new_branch")
+        if new_role == "Warehouse":
+            branch_options = ["Buntun Warehouse", "Echague Warehouse", "Santa Maria Warehouse"]
+            new_branch = st.selectbox("Assigned Warehouse", branch_options, key="admin_new_branch")
+        else:
+            branch_options = ["Main Store / All Branches"] + available_branches()
+            default_branch = "Main Store / All Branches" if new_role in ("Admin", "Super Admin") else branch_options[0]
+            new_branch = st.selectbox("Branch", branch_options, index=branch_options.index(default_branch), key="admin_new_branch")
         temp_pw = st.text_input("Temporary Password", type="password", key="admin_temp_pw")
         if st.button("Create User"):
             clean_user = new_user.strip()
@@ -407,14 +411,22 @@ def admin_panel():
                     update_supabase_user(target,{"role":role_new})
                     log_activity(st.session_state["username"],"ROLE_CHANGED",f"{target}: {role_new}")
                     st.rerun()
-        branch_options=["Main Store / All Branches"]+available_branches()
-        current_branch=selected.get("branch") or "Main Store / All Branches"
-        if current_branch not in branch_options: branch_options.append(current_branch)
-        assigned=st.selectbox("Assigned Branch",branch_options,index=branch_options.index(current_branch),key=f"perm_branch_{target}")
-        if st.button("Update Assigned Branch"):
+        if selected.get("role") == "Warehouse":
+            branch_options=["Buntun Warehouse", "Echague Warehouse", "Santa Maria Warehouse"]
+            current_branch=selected.get("branch") or branch_options[0]
+            if current_branch not in branch_options: branch_options.append(current_branch)
+            assigned=st.selectbox("Assigned Warehouse",branch_options,index=branch_options.index(current_branch),key=f"perm_branch_{target}")
+            update_assignment_label="Update Assigned Warehouse"
+        else:
+            branch_options=["Main Store / All Branches"]+available_branches()
+            current_branch=selected.get("branch") or "Main Store / All Branches"
+            if current_branch not in branch_options: branch_options.append(current_branch)
+            assigned=st.selectbox("Assigned Branch",branch_options,index=branch_options.index(current_branch),key=f"perm_branch_{target}")
+            update_assignment_label="Update Assigned Branch"
+        if st.button(update_assignment_label):
             update_supabase_user(target,{"branch":assigned})
             log_activity(st.session_state["username"],"BRANCH_CHANGED",f"{target}: {assigned}")
-            st.success("Assigned branch updated."); st.rerun()
+            st.success("Assignment updated."); st.rerun()
     else:
         st.info("No permanent accounts found yet.")
 
