@@ -349,7 +349,7 @@ def admin_panel():
     with st.expander("Create New User", expanded=False):
         new_user = st.text_input("New Username", key="admin_new_username")
         full_name = st.text_input("Name", key="admin_new_full_name")
-        new_role = st.selectbox("Role", ["User", "Admin", "Super Admin"], key="admin_new_role")
+        new_role = st.selectbox("Role", ["User", "Warehouse", "Admin", "Super Admin"], key="admin_new_role")
         branch_options = ["Main Store / All Branches"] + available_branches()
         default_branch = "Main Store / All Branches" if new_role in ("Admin", "Super Admin") else branch_options[0]
         new_branch = st.selectbox("Branch", branch_options, index=branch_options.index(default_branch), key="admin_new_branch")
@@ -397,7 +397,7 @@ def admin_panel():
                     log_activity(st.session_state["username"],"PASSWORD_RESET",target)
                     st.success("Password reset. User must change it on next login.")
         with c3:
-            roles=["User","Admin","Super Admin"]
+            roles=["User","Warehouse","Admin","Super Admin"]
             role_now=selected.get("role","User") if selected.get("role","User") in roles else "User"
             role_new=st.selectbox("Change Role",roles,index=roles.index(role_now),key=f"perm_role_{target}")
             if st.button("Update Role"):
@@ -2950,6 +2950,14 @@ if is_admin:
     elif mode=="User Management": admin_panel()
     elif mode=="Database Backup": database_backup()
     elif mode=="Settings": branch_management()
+elif current_role == "Warehouse":
+    mode=st.sidebar.radio("Warehouse Menu",["Dashboard","Warehouse Inventory"])
+    if mode=="Dashboard":
+        st.markdown("## Warehouse Dashboard")
+        render_daily_brew()
+        st.info("Warehouse preparation lists will appear here after Super Admin sends an allocation to warehouses.")
+    elif mode=="Warehouse Inventory":
+        render_warehouse_inventory(current_user,current_role)
 else:
     mode=st.sidebar.radio("Branch Menu",["Dashboard","Order Requests","Stock Count","My Orders","Receive Delivery","Variances","History"])
     if mode=="Dashboard":
