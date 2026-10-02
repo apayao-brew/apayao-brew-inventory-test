@@ -66,6 +66,23 @@ def _balance(warehouse_id, category):
         'order':'name.asc'
     })
 
+
+def _weekly_inventory(warehouse_id, category):
+    return _request('warehouse_weekly_inventory', params={
+        'select':'item_id,warehouse_id,category,item_name,unit,beginning,deliveries,total,pull_out,stock,previous_count_date',
+        'warehouse_id':'eq.'+warehouse_id,
+        'category':'eq.'+category,
+        'order':'item_name.asc'
+    })
+
+def _inventory_history(warehouse_id, category):
+    return _request('warehouse_inventory_history', params={
+        'select':'count_id,warehouse_id,warehouse,category,count_date,status,submitted_by,submitted_at,variance_explanation,proof_reference,reviewed_by,reviewed_at,item_id,item_name,unit,beginning,deliveries,total,pull_out,stock,actual,variance',
+        'warehouse_id':'eq.'+warehouse_id,
+        'category':'eq.'+category,
+        'order':'count_date.desc,item_name.asc'
+    })
+
 def _template(warehouse_name):
     cats = WAREHOUSE_CATEGORIES[warehouse_name]
     frame = pd.DataFrame({
@@ -118,7 +135,7 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
     except Exception as exc:
         st.error(str(exc)); return
 
-    tabs = st.tabs(['Stock Balance','Receive Stock','Monday Stock Count','Item Masterlist','Dispatch History'])
+    tabs = st.tabs(['Stock Balance','Monday Stock Count','Item Masterlist','Dispatch History'])
 
     with tabs[0]:
         st.subheader(f'{warehouse_name} — {category}')
@@ -127,104 +144,127 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
             st.dataframe(view[['Item','Unit','Available Stock']],hide_index=True,use_container_width=True)
         else:
             st.info('No items yet for this warehouse/category. Add them under Item Masterlist.')
+        st.caption('Supplier receiving is handled only in Warehouse Deliveries to prevent duplicate stock posting.')
 
     with tabs[1]:
-        st.subheader(f'Receive Stock — {warehouse_name}')
-        if category in ('Pastries','Store Items'):
-            st.info('For Buntun Pastries and Store Items, the dedicated Receive → Dispatch → Reconcile workflow will be added in the next TEST stage. For now, do not use normal receiving for these categories.')
-        else:
-            mode=st.radio('Receiving method',['Manual Entry','Excel Upload'],horizontal=True,key='wh_receive_mode_v2')
-            if mode=='Manual Entry':
-                if not items:
-                    st.info('Add an item to the masterlist first.')
-                else:
-                    item_map={f"{r['name']} ({r['unit']})":r['id'] for r in items}
-                    selected=st.selectbox('Item',list(item_map),key='wh_receive_item_v2')
-                    qty=st.number_input('Received quantity',min_value=0.0,step=1.0,key='wh_receive_qty_v2')
-                    ref=st.text_input('Supplier / receiving reference',key='wh_receive_ref_v2')
-                    if st.button('SAVE RECEIVED STOCK',type='primary',disabled=qty<=0,key='wh_receive_save_v2'):
-                        try:
-                            _rpc('warehouse_receive',{'p_item_id':item_map[selected],'p_qty':qty,'p_reference':ref.strip(),'p_actor':username,'p_batch_key':None})
-                            st.success(f'Stock received into {warehouse_name}.'); st.rerun()
-                        except Exception as exc: st.error(str(exc))
-            else:
-                st.download_button('Download Excel Template',_template(warehouse_name),f'{warehouse_name}_Receiving_Template.xlsx',key='wh_template_v2')
-                upload=st.file_uploader('Upload completed receiving sheet',type=['xlsx'],key='wh_excel_v2')
-                if upload:
-                    try:
-                        frame=pd.read_excel(upload)
-                        required={'Category','Item','Quantity','Reference'}
-                        if not required.issubset(frame.columns):
-                            raise ValueError('Required columns: Category, Item, Quantity, Reference.')
-                        frame=frame.dropna(how='all').copy()
-                        frame['Quantity']=pd.to_numeric(frame['Quantity'],errors='raise')
-                        if frame.empty or frame['Quantity'].isna().any() or (frame['Quantity']<=0).any():
-                            raise ValueError('Every row must have a positive quantity.')
-                        allowed=set(WAREHOUSE_CATEGORIES[warehouse_name])
-                        if any(str(x).strip() not in allowed for x in frame['Category']):
-                            raise ValueError(f'One or more categories are not assigned to {warehouse_name}.')
-                        all_items=_request('warehouse_items',params={
-                            'select':'id,warehouse_id,category,name,active',
-                            'warehouse_id':'eq.'+warehouse_id,
-                            'active':'eq.true'
-                        })
-                        lookup={(r['category'].strip().casefold(),r['name'].strip().casefold()):r['id'] for r in all_items}
-                        payload=[]
-                        for _,row in frame.iterrows():
-                            key=(str(row['Category']).strip().casefold(),str(row['Item']).strip().casefold())
-                            if key not in lookup:
-                                raise ValueError('Unknown item/category for '+warehouse_name+': '+str(row['Category'])+' / '+str(row['Item']))
-                            payload.append({'item_id':lookup[key],'qty':float(row['Quantity']),'reference':'' if pd.isna(row['Reference']) else str(row['Reference'])})
-                        st.dataframe(frame,hide_index=True,use_container_width=True)
-                        st.caption('Preview only until Save. This upload applies only to the selected warehouse.')
-                        if st.button('SAVE UPLOADED RECEIVING',type='primary',key='wh_upload_save_v2'):
-                            import hashlib
-                            digest=hashlib.sha256((warehouse_id+':').encode()+upload.getvalue()).hexdigest()
-                            _rpc('warehouse_receive_batch',{'p_rows':payload,'p_actor':username,'p_batch_key':digest})
-                            st.success(f'Receiving sheet saved to {warehouse_name}.'); st.rerun()
-                    except Exception as exc: st.error(str(exc))
-
-    with tabs[2]:
         today=datetime.now(TZ).date()
         st.subheader(f'Monday Stock Count — {warehouse_name}')
         if category in ('Pastries','Store Items'):
-            st.info('Pastries and Store Items use Receive → Dispatch → Reconcile rather than the regular Monday warehouse count.')
+            st.info('Pastries and Store Items use their separate Receive → Dispatch → Reconcile workflow.')
         else:
-            st.caption('A variance will be shown for review. Automatic stock adjustment is not enabled in this TEST stage.')
+            try:
+                weekly=_weekly_inventory(warehouse_id,category)
+            except Exception as exc:
+                st.error(str(exc)); weekly=[]
+
+            st.caption('Beginning = previous approved Monday Actual • Deliveries = confirmed warehouse deliveries • Pull Out = completed dispatches • Actual is the only editable inventory quantity.')
             if today.weekday()!=0:
-                st.warning('Today is not Monday. You can view balances; submission opens on Monday.')
-            if balances:
-                frame=pd.DataFrame([{'Item ID':r['item_id'],'Item':r['name'],'Expected':float(r['balance']),'Actual':None} for r in balances])
+                st.warning('Today is not Monday. Current balances and past inventory remain available; submission opens on Monday.')
+
+            if weekly:
+                frame=pd.DataFrame([{
+                    'Item ID':r['item_id'],
+                    'Item':r.get('item_name',''),
+                    'Unit':r.get('unit',''),
+                    'Beginning':float(r.get('beginning') or 0),
+                    'Deliveries':float(r.get('deliveries') or 0),
+                    'Total':float(r.get('total') or 0),
+                    'Pull Out':float(r.get('pull_out') or 0),
+                    'Stock':float(r.get('stock') or 0),
+                    'Actual':None
+                } for r in weekly])
                 edited=st.data_editor(
                     frame,hide_index=True,use_container_width=True,
-                    disabled=['Item ID','Item','Expected'],
+                    disabled=['Item ID','Item','Unit','Beginning','Deliveries','Total','Pull Out','Stock'],
                     column_config={'Actual':st.column_config.NumberColumn('Actual',min_value=0.0,required=True)},
-                    key='wh_count_'+warehouse_name+'_'+category
+                    key='wh_count_final_'+warehouse_name+'_'+category
                 )
-                edited['Variance']=pd.to_numeric(edited['Expected'])-pd.to_numeric(edited['Actual'],errors='coerce')
-                st.dataframe(edited[['Item','Expected','Actual','Variance']],hide_index=True,use_container_width=True)
-                has_variance = edited['Actual'].notna().all() and (edited['Variance'].fillna(0).abs() > 0.000001).any()
+                edited['Variance']=pd.to_numeric(edited['Stock'])-pd.to_numeric(edited['Actual'],errors='coerce')
+                st.dataframe(edited[['Item','Unit','Beginning','Deliveries','Total','Pull Out','Stock','Actual','Variance']],hide_index=True,use_container_width=True)
+                complete=edited['Actual'].notna().all()
+                has_variance=complete and (edited['Variance'].fillna(0).abs()>0.000001).any()
+                explanation=''; proof_reference=''
                 if has_variance:
-                    st.warning('Variance detected. This count should be reviewed before any stock adjustment.')
-                if st.button('SUBMIT MONDAY STOCK COUNT',type='primary',disabled=today.weekday()!=0,key='wh_count_submit_v2'):
-                    if edited['Actual'].isna().any():
-                        st.error('Count every item; enter 0 for no stock.')
-                    elif has_variance:
-                        st.error('Variance detected. TEST rule: the count will not proceed until the variance review/proof workflow is added.')
+                    st.warning('Variance detected. Explanation and proof/reference are required and the count will be sent FOR REVIEW.')
+                    explanation=st.text_area('Variance Explanation',key='wh_variance_explanation')
+                    proof_reference=st.text_input('Variance Proof / Reference',help='Enter the proof filename, reference number, or other traceable proof reference.',key='wh_variance_proof_ref')
+
+                submit_disabled=today.weekday()!=0 or not complete
+                if st.button('SUBMIT MONDAY STOCK COUNT',type='primary',disabled=submit_disabled,key='wh_count_submit_final'):
+                    if has_variance and (not explanation.strip() or not proof_reference.strip()):
+                        st.error('Variance Explanation and Variance Proof / Reference are required.')
                     else:
                         try:
-                            rows=[{'item_id':r['Item ID'],'expected':float(r['Expected']),'actual':float(r['Actual'])} for _,r in edited.iterrows()]
+                            rows=[]
+                            for _,r in edited.iterrows():
+                                rows.append({
+                                    'item_id':r['Item ID'],
+                                    'beginning':float(r['Beginning']),
+                                    'deliveries':float(r['Deliveries']),
+                                    'total':float(r['Total']),
+                                    'pull_out':float(r['Pull Out']),
+                                    'stock':float(r['Stock']),
+                                    'actual':float(r['Actual'])
+                                })
                             _rpc('warehouse_submit_count',{
                                 'p_warehouse_id':warehouse_id,
                                 'p_category':category,
                                 'p_count_date':today.isoformat(),
                                 'p_rows':rows,
-                                'p_actor':username
+                                'p_actor':username,
+                                'p_explanation':explanation.strip() or None,
+                                'p_proof_reference':proof_reference.strip() or None
                             })
-                            st.success('Monday count submitted with no variance.'); st.rerun()
+                            if has_variance:
+                                st.success('Monday count submitted FOR REVIEW with the full inventory snapshot saved.')
+                            else:
+                                st.success('Monday count submitted and APPROVED. The full inventory snapshot was saved.')
+                            st.rerun()
                         except Exception as exc: st.error(str(exc))
+            else:
+                st.info('No regular inventory items found for this warehouse/category.')
 
-    with tabs[3]:
+            st.divider()
+            st.subheader('Past Inventory & Balances')
+            try:
+                history=_inventory_history(warehouse_id,category)
+                if history:
+                    hdf=pd.DataFrame(history)
+                    dates=sorted([str(x) for x in hdf['count_date'].dropna().unique()],reverse=True)
+                    selected_date=st.selectbox('Inventory Date',dates,key='wh_history_date_'+warehouse_name+'_'+category)
+                    selected=hdf[hdf['count_date'].astype(str)==selected_date].copy()
+                    if not selected.empty:
+                        first=selected.iloc[0]
+                        st.caption(
+                            f"Status: {first.get('status','')} • Submitted by: {first.get('submitted_by','')}"
+                            + (f" • Reviewed by: {first.get('reviewed_by','')}" if pd.notna(first.get('reviewed_by')) and first.get('reviewed_by') else '')
+                        )
+                        hist_view=selected.rename(columns={
+                            'item_name':'Item','unit':'Unit','beginning':'Beginning','deliveries':'Deliveries',
+                            'total':'Total','pull_out':'Pull Out','stock':'Stock','actual':'Actual','variance':'Variance'
+                        })
+                        cols=['Item','Unit','Beginning','Deliveries','Total','Pull Out','Stock','Actual','Variance']
+                        st.dataframe(hist_view[cols],hide_index=True,use_container_width=True)
+                        if first.get('variance_explanation'):
+                            st.write('Variance Explanation:',first.get('variance_explanation'))
+                        if first.get('proof_reference'):
+                            st.write('Proof / Reference:',first.get('proof_reference'))
+                        export=io.BytesIO()
+                        with pd.ExcelWriter(export,engine='openpyxl') as writer:
+                            hist_view[cols].to_excel(writer,index=False,sheet_name='Monday Inventory')
+                            pd.DataFrame([{
+                                'Warehouse':warehouse_name,'Category':category,'Inventory Date':selected_date,
+                                'Status':first.get('status',''),'Submitted By':first.get('submitted_by',''),
+                                'Reviewed By':first.get('reviewed_by',''),'Variance Explanation':first.get('variance_explanation',''),
+                                'Proof / Reference':first.get('proof_reference','')
+                            }]).to_excel(writer,index=False,sheet_name='Record Details')
+                        st.download_button('Download Historical Inventory Excel',export.getvalue(),f'{warehouse_name}_{category}_{selected_date}_Inventory.xlsx',key='wh_history_download_'+warehouse_name+'_'+category)
+                else:
+                    st.info('No past Monday inventory records yet for this warehouse/category.')
+            except Exception as exc:
+                st.error(str(exc))
+
+    with tabs[2]:
         st.subheader(f'Item Masterlist — {warehouse_name} / {category}')
         if role == 'Super Admin':
             master_mode = st.radio('Masterlist method', ['Manual Add','Excel Upload'], horizontal=True, key='wh_master_mode_v3')
@@ -275,36 +315,26 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
         else:
             st.info('No items yet for this warehouse/category.')
 
-    with tabs[4]:
+    with tabs[3]:
         st.subheader(f'Dispatch History — {warehouse_name}')
-        st.caption('Automatic deduction after branch receiving is not connected yet. This tab will become the detailed permanent dispatch audit trail.')
+        st.caption('This shows finalized warehouse dispatch movements. Direct Dispatch detail will be connected in the next TEST UI step.')
         try:
             item_rows=_request('warehouse_items',params={'select':'id,name,category','warehouse_id':'eq.'+warehouse_id})
             item_lookup={r['id']:r for r in item_rows}
             if item_lookup:
                 rows=_request('warehouse_movements',params={
                     'select':'created_at,item_id,kind,quantity,reference,actor',
-                    'kind':'eq.dispatch',
-                    'order':'created_at.desc',
-                    'limit':'500'
+                    'kind':'eq.dispatch','order':'created_at.desc','limit':'500'
                 })
                 rows=[r for r in rows if r.get('item_id') in item_lookup]
                 for r in rows:
-                    meta=item_lookup[r['item_id']]
-                    r['category']=meta['category']
-                    r['item']=meta['name']
+                    meta=item_lookup[r['item_id']]; r['category']=meta['category']; r['item']=meta['name']
                 if rows:
-                    view=pd.DataFrame(rows).rename(columns={
-                        'created_at':'Date/Time','category':'Category','item':'Item',
-                        'quantity':'Quantity','reference':'Reference','actor':'Processed By'
-                    })
+                    view=pd.DataFrame(rows).rename(columns={'created_at':'Date/Time','category':'Category','item':'Item','quantity':'Quantity','reference':'Reference','actor':'Processed By'})
                     st.dataframe(view[['Date/Time','Category','Item','Quantity','Reference','Processed By']],hide_index=True,use_container_width=True)
-                else:
-                    st.info('No warehouse dispatches yet.')
-            else:
-                st.info('No items yet for this warehouse.')
-        except Exception as exc:
-            st.error(str(exc))
+                else: st.info('No warehouse dispatches yet.')
+            else: st.info('No items yet for this warehouse.')
+        except Exception as exc: st.error(str(exc))
 
 # When the entire order/delivery workflow has migrated to Supabase, call this
 # from the dispatch transaction, NOT from an independent SQLite commit.
