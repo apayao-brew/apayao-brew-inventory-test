@@ -384,13 +384,13 @@ def admin_panel():
     with st.expander("Create New User", expanded=False):
         new_user = st.text_input("New Username", key="admin_new_username")
         full_name = st.text_input("Name", key="admin_new_full_name")
-        new_role = st.selectbox("Role", ["User", "Admin", "Super Admin"], key="admin_new_role")
+        new_role = st.selectbox("Role", ["User", "Admin", "Viewer", "Super Admin"], key="admin_new_role")
         if new_role == "Admin":
             branch_options = ["Buntun Warehouse", "Echague Warehouse", "Santa Maria Warehouse"]
             new_branch = st.selectbox("Assigned Warehouse", branch_options, key="admin_new_branch")
-        elif new_role == "Super Admin":
+        elif new_role in ("Super Admin", "Viewer"):
             new_branch = "Main Store / All Branches"
-            st.caption("Super Admin has access to all warehouses.")
+            st.caption("Viewer has read-only access to all branches/warehouses." if new_role=="Viewer" else "Super Admin has access to all warehouses.")
         else:
             branch_options = available_branches()
             new_branch = st.selectbox("Branch", branch_options, key="admin_new_branch")
@@ -443,7 +443,7 @@ def admin_panel():
                     log_activity(st.session_state["username"],"PASSWORD_RESET",target)
                     st.success("Password reset. User must change it on next login.")
         with c3:
-            roles=["User","Admin","Super Admin"]
+            roles=["User","Admin","Viewer","Super Admin"]
             stored_role=selected.get("role","User")
             role_now="Admin" if stored_role=="Warehouse" else (stored_role if stored_role in roles else "User")
             role_new=st.selectbox("Change Role",roles,index=roles.index(role_now),key=f"perm_role_{target}")
@@ -461,9 +461,9 @@ def admin_panel():
             if current_branch not in branch_options: current_branch=branch_options[0]
             assigned=st.selectbox("Assigned Warehouse",branch_options,index=branch_options.index(current_branch),key=f"perm_branch_{target}")
             update_assignment_label="Update Assigned Warehouse"
-        elif selected_role == "Super Admin":
+        elif selected_role in ("Super Admin","Viewer"):
             assigned="Main Store / All Branches"
-            st.caption("Super Admin has access to all warehouses.")
+            st.caption("Viewer is read-only across all branches/warehouses." if selected_role=="Viewer" else "Super Admin has access to all warehouses.")
             update_assignment_label="Keep Super Admin Assignment"
         else:
             branch_options=available_branches()
@@ -2151,139 +2151,105 @@ def receive_direct_dispatch():
     branch=branch_for_user()
     try:
         dispatches=_sb_request("warehouse_direct_dispatches","GET",params={
-            "select":"id,dispatch_no,warehouse_id,branch,category,source,reference,remarks,status,released_at",
-            "status":"eq.IN_TRANSIT",
-            "order":"released_at.desc"
+            "select":"id,dispatch_no,batch_no,warehouse_id,branch,category,source,reference,remarks,status,released_at,allocation_confirmation,dr_no,dr_filename,dr_pdf_base64,released_for_receiving_at",
+            "status":"eq.IN_TRANSIT","order":"released_at.desc"
         })
-        # Branch names from Direct Dispatch may be stored in uppercase (e.g. BUNTUN)
-        # while the branch account may be "Buntun". Match case-insensitively.
         dispatches=[d for d in dispatches if str(d.get("branch","")).strip().casefold()==str(branch).strip().casefold()]
     except Exception as exc:
-        st.error(f"Could not load Direct Dispatch receiving: {exc}")
-        return
-
+        st.error(f"Could not load Direct Dispatch: {exc}"); return
     if not dispatches:
-        st.info("No Direct Dispatch allocation waiting for receiving.")
-        return
+        st.info("No Direct Dispatch allocation waiting for your action."); return
 
     labels=[f"{d['dispatch_no']} — {d['category']}" for d in dispatches]
-    _target=st.session_state.pop("open_direct_dispatch_id",None)
-    _default=0
-    if _target is not None:
-        for _i,_d in enumerate(dispatches):
-            if int(_d["id"])==int(_target):
-                _default=_i
-                break
-    chosen=st.selectbox("Select Direct Dispatch",labels,index=_default,key="branch_direct_dispatch_select")
+    target=st.session_state.pop("open_direct_dispatch_id",None); default=0
+    if target is not None:
+        for i,x in enumerate(dispatches):
+            if int(x["id"])==int(target): default=i; break
+    chosen=st.selectbox("Select Direct Dispatch",labels,index=default,key="branch_direct_dispatch_select")
     d=dispatches[labels.index(chosen)]
-
-    try:
-        lines=_sb_request("warehouse_direct_dispatch_lines","GET",params={
-            "select":"id,item_id,quantity_released,quantity_received,variance,receiving_remarks",
-            "dispatch_id":f"eq.{d['id']}",
-            "order":"id.asc"
-        })
-        item_ids=[str(x["item_id"]) for x in lines]
-        item_map={}
-        if item_ids:
-            item_rows=_sb_request("warehouse_items","GET",params={
-                "select":"id,name,unit",
-                "id":"in.("+",".join(item_ids)+")"
-            })
-            item_map={str(x["id"]):x for x in item_rows}
-    except Exception as exc:
-        st.error(f"Could not load dispatch items: {exc}")
-        return
+    lines=_sb_request("warehouse_direct_dispatch_lines","GET",params={
+        "select":"id,item_id,quantity_released,quantity_received,variance,receiving_remarks",
+        "dispatch_id":f"eq.{d['id']}","order":"id.asc"})
+    ids=[str(x["item_id"]) for x in lines]; item_map={}
+    if ids:
+        ir=_sb_request("warehouse_items","GET",params={"select":"id,name,unit","id":"in.("+",".join(ids)+")"})
+        item_map={str(x["id"]):x for x in ir}
 
     st.markdown(f"### {d['dispatch_no']} • {d['category']}")
-    st.caption(f"Source: {d.get('source') or 'Direct Dispatch'} • Reference: {d.get('reference') or '—'}")
+    st.caption(f"Batch: {d.get('batch_no') or '—'} • Source: {d.get('source') or 'Direct Dispatch'} • Reference: {d.get('reference') or '—'}")
+    preview=[{"Item":item_map.get(str(x["item_id"]),{}).get("name",str(x["item_id"])),
+              "Allocated / DR Qty":float(x.get("quantity_released") or 0)} for x in lines]
+    st.dataframe(pd.DataFrame(preview),use_container_width=True,hide_index=True)
 
-    allocation_key=f"direct_alloc_confirmed_{d['id']}"
-    if not st.session_state.get(allocation_key,False):
-        st.markdown("#### Allocation for Confirmation")
-        alloc_preview=[]
-        for line in lines:
-            meta=item_map.get(str(line["item_id"]),{})
-            alloc_preview.append({
-                "Item":meta.get("name",str(line["item_id"])),
-                "Allocated / Released Qty":float(line.get("quantity_released") or 0)
-            })
-        st.dataframe(pd.DataFrame(alloc_preview),use_container_width=True,hide_index=True)
-        st.info("Please review the allocation first. Actual Receiving will open only after you confirm this allocation.")
-        if st.button("CONFIRM ALLOCATION",type="primary",use_container_width=True,
-                     key=f"confirm_direct_alloc_{d['id']}"):
-            st.session_state[allocation_key]=True
-            st.success("Allocation confirmed. You may now input Actual Received.")
-            st.rerun()
+    if str(d.get("allocation_confirmation") or "PENDING").upper()!="CONFIRMED":
+        st.info("Review the allocation first. Receiving will not open yet.")
+        if st.button("CONFIRM ALLOCATION",type="primary",use_container_width=True,key=f"confirm_direct_alloc_{d['id']}"):
+            try:
+                _warehouse_delivery_rpc("warehouse_confirm_direct_allocation",{"p_dispatch_id":int(d["id"]),"p_actor":current_user})
+                st.success("Allocation confirmed. Please wait for Super Admin to generate and release the DR."); st.rerun()
+            except Exception as exc: st.error(str(exc))
         return
 
-    st.success("Allocation confirmed • Receiving Pending")
+    if not d.get("dr_no") or not d.get("released_for_receiving_at"):
+        st.success("Allocation confirmed.")
+        st.info("Waiting for Super Admin to generate the Delivery Receipt and release this batch for receiving.")
+        return
+
+    st.success(f"DR Released for Receiving • {d['dr_no']}")
+    if d.get("dr_pdf_base64"):
+        try:
+            import base64
+            st.download_button("📄 VIEW / DOWNLOAD DELIVERY RECEIPT",base64.b64decode(d["dr_pdf_base64"]),
+                               file_name=d.get("dr_filename") or f"{d['dr_no']}.pdf",mime="application/pdf",use_container_width=True)
+        except Exception: pass
+
     rows=[]; incomplete=False
     h1,h2,h3,h4=st.columns([3,1,1,1])
-    h1.markdown("**Item**"); h2.markdown("**Released**"); h3.markdown("**Actual Received**"); h4.markdown("**Variance**")
-    for idx,line in enumerate(lines):
-        meta=item_map.get(str(line["item_id"]),{})
-        item_name=meta.get("name",str(line["item_id"]))
+    h1.markdown("**Item**"); h2.markdown("**DR Qty**"); h3.markdown("**Actual Received**"); h4.markdown("**Variance**")
+    for line in lines:
+        name=item_map.get(str(line["item_id"]),{}).get("name",str(line["item_id"]))
         released=float(line.get("quantity_released") or 0)
-        c1,c2,c3,c4=st.columns([3,1,1,1])
-        c1.write(item_name); c2.write(f"{released:g}")
-        actual=c3.number_input("Actual Received",min_value=0.0,step=1.0,value=None,
-            key=f"direct_recv_{d['id']}_{line['id']}",label_visibility="collapsed")
-        if actual is None:
-            incomplete=True; variance=None; c4.write("—")
-        else:
-            variance=float(actual)-released
-            c4.write(f"{variance:+g}" if variance else "0")
-        rows.append({"line_id":int(line["id"]),"Item":item_name,"Released":released,
-                     "Actual Received":actual,"Variance":variance})
-
+        c1,c2,c3,c4=st.columns([3,1,1,1]); c1.write(name); c2.write(f"{released:g}")
+        actual=c3.number_input("Actual Received",min_value=0.0,step=1.0,value=None,key=f"direct_recv_{d['id']}_{line['id']}",label_visibility="collapsed")
+        if actual is None: incomplete=True; variance=None; c4.write("—")
+        else: variance=float(actual)-released; c4.write(f"{variance:+g}" if variance else "0")
+        rows.append({"line_id":int(line["id"]),"Item":name,"Released":released,"Actual Received":actual,"Variance":variance})
     entry=pd.DataFrame(rows)
     has_variance=entry["Variance"].notna().any() and (entry["Variance"].dropna()!=0).any()
-    remarks=st.text_area("Explanation / reason *" if has_variance else "Remarks (optional)",
-                         key=f"direct_recv_remarks_{d['id']}")
+    remarks=st.text_area("Variance Explanation / Reason *" if has_variance else "Remarks (optional)",key=f"direct_recv_remarks_{d['id']}")
+    proof=None
     if has_variance:
-        st.warning("Variance detected. Explanation is required. This dispatch will be sent FOR REVIEW and warehouse stock will not be finally deducted yet.")
-
+        st.warning("Variance detected. Explanation AND proof are required before Review Direct Dispatch Receiving is enabled.")
+        proof=st.file_uploader("Upload Variance Proof *",type=["jpg","jpeg","png","pdf"],key=f"direct_recv_proof_{d['id']}")
+    review_disabled=incomplete or (has_variance and (not remarks.strip() or proof is None))
     if st.button("REVIEW DIRECT DISPATCH RECEIVING",type="primary",use_container_width=True,
-                 key=f"review_direct_recv_{d['id']}"):
-        if incomplete:
-            st.error("Enter Actual Received for every item. Enter 0 if none was received.")
-        elif has_variance and not remarks.strip():
-            st.error("Enter an explanation for the variance.")
-        else:
-            st.session_state[f"direct_recv_review_{d['id']}"]={
-                "rows":entry.to_dict("records"),"remarks":remarks.strip()
-            }
-            st.success("Review complete. Confirm below to submit receiving.")
-
-    review_key=f"direct_recv_review_{d['id']}"
-    if review_key in st.session_state:
-        review=pd.DataFrame(st.session_state[review_key]["rows"])
+                 disabled=review_disabled,key=f"review_direct_recv_{d['id']}"):
+        import base64
+        st.session_state[f"direct_recv_review_{d['id']}"]={
+            "rows":entry.to_dict("records"),"remarks":remarks.strip(),
+            "proof_name":proof.name if proof else None,
+            "proof_mime":proof.type if proof else None,
+            "proof_base64":base64.b64encode(proof.getvalue()).decode("ascii") if proof else None}
+        st.success("Review complete. Confirm below to submit receiving.")
+    rk=f"direct_recv_review_{d['id']}"
+    if rk in st.session_state:
+        payload=st.session_state[rk]
         st.markdown("##### Review")
-        st.dataframe(review[["Item","Released","Actual Received","Variance"]],
-                     use_container_width=True,hide_index=True)
-        if st.button("CONFIRM & SUBMIT DIRECT DISPATCH RECEIVING",type="primary",
-                     use_container_width=True,key=f"confirm_direct_recv_{d['id']}"):
-            payload=st.session_state[review_key]
-            received_rows=[
-                {"line_id":int(r["line_id"]),"quantity_received":float(r["Actual Received"])}
-                for r in payload["rows"]
-            ]
+        st.dataframe(pd.DataFrame(payload["rows"])[["Item","Released","Actual Received","Variance"]],use_container_width=True,hide_index=True)
+        if payload.get("proof_name"): st.write(f"**Proof:** {payload['proof_name']}")
+        if st.button("CONFIRM & SUBMIT DIRECT DISPATCH RECEIVING",type="primary",use_container_width=True,key=f"confirm_direct_recv_{d['id']}"):
+            received_rows=[{"line_id":int(r["line_id"]),"quantity_received":float(r["Actual Received"])} for r in payload["rows"]]
             try:
                 _warehouse_delivery_rpc("warehouse_confirm_direct_receiving",{
-                    "p_dispatch_id":int(d["id"]),
-                    "p_rows":received_rows,
-                    "p_actor":current_user,
-                    "p_remarks":payload["remarks"]
-                })
-                st.session_state.pop(review_key,None)
+                    "p_dispatch_id":int(d["id"]),"p_rows":received_rows,"p_actor":current_user,
+                    "p_remarks":payload["remarks"],"p_proof_name":payload.get("proof_name"),
+                    "p_proof_mime":payload.get("proof_mime"),"p_proof_base64":payload.get("proof_base64")})
+                st.session_state.pop(rk,None)
                 if any(float(r["Variance"] or 0)!=0 for r in payload["rows"]):
-                    st.warning("Receiving submitted WITH VARIANCE. It is waiting for Admin review; final warehouse deduction has not been posted.")
-                else:
-                    st.success("Receiving confirmed. Direct Dispatch is COMPLETED and the warehouse stock has been deducted.")
+                    st.warning("Receiving submitted WITH VARIANCE and is waiting for Admin/Super Admin review.")
+                else: st.success("Receiving confirmed. Direct Dispatch is COMPLETED.")
                 st.rerun()
-            except Exception as exc:
-                st.error(f"Could not submit Direct Dispatch receiving: {exc}")
+            except Exception as exc: st.error(f"Could not submit Direct Dispatch receiving: {exc}")
 
 def receive_delivery():
     st.markdown("## Receiving")
@@ -2772,10 +2738,105 @@ def render_manual_dr_generator():
     )
 
 
+def direct_dispatch_dr_generator():
+    st.markdown("### Direct Dispatch DR")
+    try:
+        rows=_sb_request("warehouse_direct_dispatches","GET",params={
+            "select":"id,dispatch_no,batch_no,warehouse_id,branch,category,status,allocation_confirmation,dr_no,dr_filename,dr_pdf_base64,released_for_receiving_at",
+            "status":"eq.IN_TRANSIT","order":"released_at.desc"})
+    except Exception as exc:
+        st.error(str(exc)); return
+    batches=sorted({str(x.get("batch_no") or "") for x in rows if x.get("batch_no")},reverse=True)
+    if not batches: st.info("No Direct Dispatch batch is waiting for DR generation."); return
+    batch=st.selectbox("Direct Dispatch Batch",batches,key="dd_dr_batch")
+    br=[x for x in rows if str(x.get("batch_no"))==batch]
+    all_confirmed=all(str(x.get("allocation_confirmation") or "").upper()=="CONFIRMED" for x in br)
+    st.dataframe(pd.DataFrame([{"Branch":x["branch"],"Category":x["category"],"Allocation Confirmation":x.get("allocation_confirmation"),"DR No.":x.get("dr_no") or "Not Generated"} for x in br]),use_container_width=True,hide_index=True)
+    if not all_confirmed:
+        st.warning("DR generation is locked until ALL branches in this batch confirm their allocation."); return
+    base_dr=st.text_input("DR Base No. *",value=batch,key=f"dd_base_{batch}")
+    store_origin=st.text_input("Store Origin *",value="MAIN STORE",key=f"dd_origin_{batch}")
+    prepared_by=st.text_input("Prepared By *",value=current_user,key=f"dd_prep_{batch}")
+    delivered_by=st.text_input("Delivered By / Driver *",key=f"dd_driver_{batch}")
+    delivery_date=st.date_input("Delivery Date *",value=date.today(),key=f"dd_date_{batch}")
+    approved_by=st.text_input("Approved By *",value="Glady Clemente/ Coleen Navaro",key=f"dd_approve_{batch}")
+    remarks=st.text_area("Remarks",key=f"dd_rem_{batch}")
+    required=base_dr.strip() and store_origin.strip() and prepared_by.strip() and delivered_by.strip() and approved_by.strip()
+    payload=[]; singles={}
+    if required:
+        for d in br:
+            lines=_sb_request("warehouse_direct_dispatch_lines","GET",params={"select":"item_id,quantity_released","dispatch_id":f"eq.{d['id']}","order":"id.asc"})
+            ids=[str(x["item_id"]) for x in lines]; im={}
+            if ids:
+                ir=_sb_request("warehouse_items","GET",params={"select":"id,name","id":"in.("+",".join(ids)+")"}); im={str(x["id"]):x["name"] for x in ir}
+            bp={"branch":d["branch"],"items":[(im.get(str(x["item_id"]),str(x["item_id"])),float(x["quantity_released"] or 0)) for x in lines]}
+            payload.append(bp); singles[int(d["id"])]=bp
+    if st.button("GENERATE & SAVE DIRECT DISPATCH DRs",type="primary",use_container_width=True,disabled=not bool(required),key=f"dd_save_{batch}"):
+        import base64
+        try:
+            for d in br:
+                final_no=dr_no_text(base_dr,delivery_date,d["branch"])
+                pdf=build_single_pdf(singles[int(d["id"])],d["category"],base_dr,store_origin,prepared_by,delivered_by,delivery_date,approved_by,current_user,None)
+                _sb_request("warehouse_direct_dispatches","PATCH",params={"id":f"eq.{d['id']}"},payload={
+                    "dr_no":final_no,"dr_filename":f"DR_{safe_filename(final_no)}_{safe_filename(d['branch'])}.pdf",
+                    "dr_pdf_base64":base64.b64encode(pdf).decode("ascii"),"dr_created_by":current_user,
+                    "dr_created_at":datetime.now().isoformat(),"receiving_remarks":remarks.strip()})
+            st.success("Direct Dispatch DRs generated and saved for all branches."); st.rerun()
+        except Exception as exc: st.error(str(exc))
+    if all(x.get("dr_no") for x in br):
+        if st.button("RELEASE BATCH FOR RECEIVING",type="primary",use_container_width=True,key=f"dd_release_recv_{batch}"):
+            try:
+                _warehouse_delivery_rpc("warehouse_release_direct_for_receiving",{"p_batch_no":batch,"p_actor":current_user})
+                st.success("DRs released. Branches can now input Actual Received."); st.rerun()
+            except Exception as exc: st.error(str(exc))
+
+def direct_dispatch_receiving_overview():
+    st.markdown("### Direct Dispatch Receiving Overview")
+    try:
+        rows=_sb_request("warehouse_direct_dispatch_overview","GET",params={"select":"*","order":"id.desc"})
+    except Exception as exc:
+        st.error(str(exc)); return
+    if current_role=="Admin":
+        assigned=str(st.session_state.get("branch","")).replace(" Warehouse","").strip().casefold()
+        rows=[x for x in rows if str(x.get("warehouse","")).replace(" Warehouse","").strip().casefold()==assigned]
+    if not rows: st.info("No Direct Dispatch receiving records."); return
+    df=pd.DataFrame(rows)
+    show=[c for c in ["batch_no","dispatch_no","warehouse","branch","category","dr_no","released_qty","received_qty","variance","allocation_confirmation","status","receiving_proof_name"] if c in df.columns]
+    st.dataframe(df[show],use_container_width=True,hide_index=True)
+    labels=[f"{x.get('dispatch_no')} — {x.get('branch')} — {x.get('status')}" for x in rows]
+    pick=st.selectbox("View Direct Dispatch Receiving",labels,key=f"dd_overview_{current_role}")
+    d=rows[labels.index(pick)]
+    if d.get("receiving_remarks"): st.write(f"**Receiving Remarks / Variance Explanation:** {d['receiving_remarks']}")
+    if d.get("receiving_proof_name"): st.write(f"**Proof:** {d['receiving_proof_name']}")
+
+def viewer_portal():
+    st.markdown("## Viewer Dashboard")
+    st.info("VIEW ONLY — this account cannot create, edit, release, receive, approve, upload, generate DRs, manage users, or change system data.")
+    tab1,tab2,tab3,tab4,tab5=st.tabs(["Orders & Deliveries","Warehouse Inventory","Warehouse Deliveries","Direct Dispatch / Receiving","Transaction History"])
+    with tab1:
+        with db_conn() as c:
+            q=pd.read_sql_query("""SELECT oc.order_no,oc.category,oc.status,cb.branch,cb.status branch_status,
+                cb.allocation_confirmation,d.delivery_no,d.status delivery_status
+                FROM order_cycles oc LEFT JOIN order_cycle_branches cb ON cb.cycle_id=oc.id
+                LEFT JOIN deliveries_v2 d ON d.cycle_branch_id=cb.id ORDER BY oc.id DESC""",c)
+        st.dataframe(q,use_container_width=True,hide_index=True)
+    with tab2:
+        try:
+            rows=_sb_request("warehouse_balances","GET",params={"select":"*"})
+            st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        except Exception as exc: st.error(str(exc))
+    with tab3:
+        try:
+            rows=_sb_request("warehouse_delivery_accounting","GET",params={"select":"*","order":"id.desc"})
+            st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        except Exception as exc: st.error(str(exc))
+    with tab4: direct_dispatch_receiving_overview()
+    with tab5: transaction_history()
+
 def render_dr_generator():
     st.markdown("## Delivery Receipt Generator")
     st.caption("Generate DRs from confirmed branch allocations. Select one, several, or all branches and preview before downloading.")
-    tab_auto, tab_manual = st.tabs(["AUTOMATIC DR", "MANUAL EXCEL DR"])
+    tab_auto, tab_direct, tab_manual = st.tabs(["ORDER REQUEST DR", "DIRECT DISPATCH DR", "MANUAL EXCEL DR"])
     with tab_auto:
         with db_conn() as c:
             cycles=pd.read_sql_query("""SELECT oc.id,oc.order_no,oc.category,oc.delivery_date,oc.created_at
@@ -2843,8 +2904,10 @@ def render_dr_generator():
                     except sqlite3.IntegrityError:
                         st.error("A generated DR No. is already in use. Change the DR Base No. and preview again.")
                 st.download_button("⬇️ DOWNLOAD ALL SELECTED DRs — ONE PDF",data=pdf,file_name=f"DR_{safe_filename(base_dr)}_ALL_SELECTED.pdf",mime="application/pdf",use_container_width=True)
+    with tab_direct:
+        direct_dispatch_dr_generator()
     with tab_manual:
-        st.info("Use this only for deliveries that did not originate from an Order Request.")
+        st.info("Use this only for deliveries that did not originate from an Order Request or Direct Dispatch.")
         render_manual_dr_generator()
 
 
@@ -3336,7 +3399,7 @@ from warehouse_inventory import render_warehouse_inventory
 if current_role == "Super Admin":
     st.sidebar.markdown("#### Operations")
     mode = st.sidebar.radio("System Menu", [
-        "Dashboard", "Orders & Allocation", "Receiving & Variances", "Deliveries",
+        "Dashboard", "Orders & Allocation", "Receiving & Variances", "Direct Dispatch Receiving", "Deliveries",
         "Warehouse Inventory", "Warehouse Deliveries", "Stock Count Requests",
         "Delivery Receipt Generator", "Transaction History", "User Management",
         "Database Backup", "Settings"
@@ -3350,6 +3413,7 @@ if current_role == "Super Admin":
         a,b,c1=st.columns(3); a.metric("Order Requests",total); b.metric("Pending Branch Submissions",pending); c1.metric("For Receiving",recv)
     elif mode == "Orders & Allocation": super_orders()
     elif mode == "Receiving & Variances": receiving_variances_admin()
+    elif mode == "Direct Dispatch Receiving": direct_dispatch_receiving_overview()
     elif mode == "Deliveries": deliveries_history()
     elif mode == "Warehouse Inventory": render_warehouse_inventory(current_user,current_role,st.session_state.get("branch", ""))
     elif mode == "Warehouse Deliveries": warehouse_deliveries_admin()
@@ -3362,12 +3426,17 @@ if current_role == "Super Admin":
 
 elif current_role == "Admin":
     st.sidebar.markdown("#### Warehouse Operations")
-    mode = st.sidebar.radio("Warehouse Menu", ["Dashboard", "Warehouse Inventory", "Warehouse Transaction History"], label_visibility="collapsed")
+    mode = st.sidebar.radio("Warehouse Menu", ["Dashboard", "Warehouse Inventory", "Direct Dispatch Receiving", "Warehouse Transaction History"], label_visibility="collapsed")
     if mode == "Dashboard":
         st.markdown(f"## {st.session_state.get('branch','Warehouse')} Dashboard"); render_daily_brew()
         st.caption("This Admin account is locked to its assigned warehouse.")
     elif mode == "Warehouse Inventory": render_warehouse_inventory(current_user,current_role,st.session_state.get("branch", ""))
+    elif mode == "Direct Dispatch Receiving": direct_dispatch_receiving_overview()
     elif mode == "Warehouse Transaction History": transaction_history()
+
+elif current_role == "Viewer":
+    st.sidebar.markdown("#### Read Only")
+    viewer_portal()
 
 else:
     st.sidebar.markdown("#### Branch Operations")
@@ -3413,7 +3482,7 @@ else:
         # Direct Dispatch pending actions for this branch.
         try:
             _dd_pending=_sb_request("warehouse_direct_dispatches","GET",params={
-                "select":"id,dispatch_no,branch,category,status,released_at",
+                "select":"id,dispatch_no,branch,category,status,released_at,allocation_confirmation,dr_no,released_for_receiving_at",
                 "status":"eq.IN_TRANSIT",
                 "order":"released_at.desc"
             })
@@ -3426,25 +3495,16 @@ else:
             st.markdown("### 🔔 Pending Actions")
 
             for _dd in _dd_pending:
-                _akey=f"direct_alloc_confirmed_{_dd['id']}"
-                if not st.session_state.get(_akey,False):
+                if str(_dd.get("allocation_confirmation") or "PENDING").upper()!="CONFIRMED":
                     st.warning(f"Allocation Confirmation Pending • {_dd['dispatch_no']} • {_dd['category']}")
-                    st.button(
-                        "Review Direct Dispatch Allocation",
-                        key=f"dash_direct_alloc_{_dd['id']}",
-                        use_container_width=True,
-                        on_click=_branch_nav,
-                        args=("Receiving","open_direct_dispatch_id",int(_dd["id"]))
-                    )
+                    st.button("Review Direct Dispatch Allocation",key=f"dash_direct_alloc_{_dd['id']}",use_container_width=True,
+                              on_click=_branch_nav,args=("Receiving","open_direct_dispatch_id",int(_dd["id"])))
+                elif not _dd.get("released_for_receiving_at"):
+                    st.info(f"Allocation Confirmed • Waiting for DR • {_dd['dispatch_no']} • {_dd['category']}")
                 else:
                     st.warning(f"Receiving Pending • {_dd['dispatch_no']} • {_dd['category']}")
-                    st.button(
-                        "Input Direct Dispatch Receiving",
-                        key=f"dash_direct_recv_{_dd['id']}",
-                        use_container_width=True,
-                        on_click=_branch_nav,
-                        args=("Receiving","open_direct_dispatch_id",int(_dd["id"]))
-                    )
+                    st.button("Input Direct Dispatch Receiving",key=f"dash_direct_recv_{_dd['id']}",use_container_width=True,
+                              on_click=_branch_nav,args=("Receiving","open_direct_dispatch_id",int(_dd["id"])))
 
             for cb_id, order_no, category in pending_allocations:
                 c1,c2=st.columns([4,1])
