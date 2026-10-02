@@ -2167,7 +2167,14 @@ def receive_direct_dispatch():
         return
 
     labels=[f"{d['dispatch_no']} — {d['category']}" for d in dispatches]
-    chosen=st.selectbox("Select Direct Dispatch",labels,key="branch_direct_dispatch_select")
+    _target=st.session_state.pop("open_direct_dispatch_id",None)
+    _default=0
+    if _target is not None:
+        for _i,_d in enumerate(dispatches):
+            if int(_d["id"])==int(_target):
+                _default=_i
+                break
+    chosen=st.selectbox("Select Direct Dispatch",labels,index=_default,key="branch_direct_dispatch_select")
     d=dispatches[labels.index(chosen)]
 
     try:
@@ -2190,6 +2197,27 @@ def receive_direct_dispatch():
 
     st.markdown(f"### {d['dispatch_no']} • {d['category']}")
     st.caption(f"Source: {d.get('source') or 'Direct Dispatch'} • Reference: {d.get('reference') or '—'}")
+
+    allocation_key=f"direct_alloc_confirmed_{d['id']}"
+    if not st.session_state.get(allocation_key,False):
+        st.markdown("#### Allocation for Confirmation")
+        alloc_preview=[]
+        for line in lines:
+            meta=item_map.get(str(line["item_id"]),{})
+            alloc_preview.append({
+                "Item":meta.get("name",str(line["item_id"])),
+                "Allocated / Released Qty":float(line.get("quantity_released") or 0)
+            })
+        st.dataframe(pd.DataFrame(alloc_preview),use_container_width=True,hide_index=True)
+        st.info("Please review the allocation first. Actual Receiving will open only after you confirm this allocation.")
+        if st.button("CONFIRM ALLOCATION",type="primary",use_container_width=True,
+                     key=f"confirm_direct_alloc_{d['id']}"):
+            st.session_state[allocation_key]=True
+            st.success("Allocation confirmed. You may now input Actual Received.")
+            st.rerun()
+        return
+
+    st.success("Allocation confirmed • Receiving Pending")
     rows=[]; incomplete=False
     h1,h2,h3,h4=st.columns([3,1,1,1])
     h1.markdown("**Item**"); h2.markdown("**Released**"); h3.markdown("**Actual Received**"); h4.markdown("**Variance**")
@@ -3377,6 +3405,35 @@ else:
 
         if pending_allocations or pending_stock_counts:
             st.markdown("### 🔔 Pending Actions")
+
+        # Direct Dispatch pending actions for this branch.
+        try:
+            _dd_pending=_sb_request("warehouse_direct_dispatches","GET",params={
+                "select":"id,dispatch_no,branch,category,status,released_at",
+                "status":"eq.IN_TRANSIT",
+                "order":"released_at.desc"
+            })
+            _dd_pending=[x for x in _dd_pending
+                         if str(x.get("branch","")).strip().casefold()==str(branch).strip().casefold()]
+        except Exception:
+            _dd_pending=[]
+
+        for _dd in _dd_pending:
+            _akey=f"direct_alloc_confirmed_{_dd['id']}"
+            if not st.session_state.get(_akey,False):
+                st.warning(f"Allocation Confirmation Pending • {_dd['dispatch_no']} • {_dd['category']}")
+                if st.button("Review Direct Dispatch Allocation",
+                             key=f"dash_direct_alloc_{_dd['id']}",use_container_width=True):
+                    st.session_state["open_direct_dispatch_id"]=int(_dd["id"])
+                    st.session_state["branch_menu_mode"]="Receiving"
+                    st.rerun()
+            else:
+                st.warning(f"Receiving Pending • {_dd['dispatch_no']} • {_dd['category']}")
+                if st.button("Input Direct Dispatch Receiving",
+                             key=f"dash_direct_recv_{_dd['id']}",use_container_width=True):
+                    st.session_state["open_direct_dispatch_id"]=int(_dd["id"])
+                    st.session_state["branch_menu_mode"]="Receiving"
+                    st.rerun()
             for cb_id, order_no, category in pending_allocations:
                 c1,c2=st.columns([4,1])
                 c1.warning(f"Allocation waiting for approval — {order_no} • {category}")
