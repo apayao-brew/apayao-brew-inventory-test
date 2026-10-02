@@ -2740,74 +2740,256 @@ def render_manual_dr_generator():
 
 def direct_dispatch_dr_generator():
     st.markdown("### Direct Dispatch DR")
+    st.caption("Generate a DR as soon as a branch confirms its Direct Dispatch allocation.")
     try:
-        rows=_sb_request("warehouse_direct_dispatches","GET",params={
-            "select":"id,dispatch_no,batch_no,warehouse_id,branch,category,status,allocation_confirmation,dr_no,dr_filename,dr_pdf_base64,released_for_receiving_at",
-            "status":"eq.IN_TRANSIT","order":"released_at.desc"})
+        # Do not restrict this page to IN_TRANSIT only. Some database/RPC versions
+        # change the dispatch status when the branch confirms the allocation, which
+        # previously made the confirmed dispatch disappear from the DR Generator.
+        rows = _sb_request("warehouse_direct_dispatches", "GET", params={
+            "select": "id,dispatch_no,batch_no,warehouse_id,branch,category,status,allocation_confirmation,dr_no,dr_filename,dr_pdf_base64,released_for_receiving_at",
+            "order": "id.desc"
+        })
     except Exception as exc:
-        st.error(str(exc)); return
-    batches=sorted({str(x.get("batch_no") or "") for x in rows if x.get("batch_no")},reverse=True)
-    if not batches: st.info("No Direct Dispatch batch is waiting for DR generation."); return
-    batch=st.selectbox("Direct Dispatch Batch",batches,key="dd_dr_batch")
-    br=[x for x in rows if str(x.get("batch_no"))==batch]
-    all_confirmed=all(str(x.get("allocation_confirmation") or "").upper()=="CONFIRMED" for x in br)
-    st.dataframe(pd.DataFrame([{"Branch":x["branch"],"Category":x["category"],"Allocation Confirmation":x.get("allocation_confirmation"),"DR No.":x.get("dr_no") or "Not Generated"} for x in br]),use_container_width=True,hide_index=True)
-    if not all_confirmed:
-        st.warning("DR generation is locked until ALL branches in this batch confirm their allocation."); return
-    base_dr=st.text_input("DR Base No. *",value=batch,key=f"dd_base_{batch}")
-    store_origin=st.text_input("Store Origin *",value="MAIN STORE",key=f"dd_origin_{batch}")
-    prepared_by=st.text_input("Prepared By *",value=current_user,key=f"dd_prep_{batch}")
-    delivered_by=st.text_input("Delivered By / Driver *",key=f"dd_driver_{batch}")
-    delivery_date=st.date_input("Delivery Date *",value=date.today(),key=f"dd_date_{batch}")
-    approved_by=st.text_input("Approved By *",value="Glady Clemente/ Coleen Navaro",key=f"dd_approve_{batch}")
-    remarks=st.text_area("Remarks",key=f"dd_rem_{batch}")
-    required=base_dr.strip() and store_origin.strip() and prepared_by.strip() and delivered_by.strip() and approved_by.strip()
-    payload=[]; singles={}
-    if required:
-        for d in br:
-            lines=_sb_request("warehouse_direct_dispatch_lines","GET",params={"select":"item_id,quantity_released","dispatch_id":f"eq.{d['id']}","order":"id.asc"})
-            ids=[str(x["item_id"]) for x in lines]; im={}
-            if ids:
-                ir=_sb_request("warehouse_items","GET",params={"select":"id,name","id":"in.("+",".join(ids)+")"}); im={str(x["id"]):x["name"] for x in ir}
-            bp={"branch":d["branch"],"items":[(im.get(str(x["item_id"]),str(x["item_id"])),float(x["quantity_released"] or 0)) for x in lines]}
-            payload.append(bp); singles[int(d["id"])]=bp
-    if st.button("GENERATE & SAVE DIRECT DISPATCH DRs",type="primary",use_container_width=True,disabled=not bool(required),key=f"dd_save_{batch}"):
-        import base64
-        try:
-            for d in br:
-                final_no=dr_no_text(base_dr,delivery_date,d["branch"])
-                pdf=build_single_pdf(singles[int(d["id"])],d["category"],base_dr,store_origin,prepared_by,delivered_by,delivery_date,approved_by,current_user,None)
-                _sb_request("warehouse_direct_dispatches","PATCH",params={"id":f"eq.{d['id']}"},payload={
-                    "dr_no":final_no,"dr_filename":f"DR_{safe_filename(final_no)}_{safe_filename(d['branch'])}.pdf",
-                    "dr_pdf_base64":base64.b64encode(pdf).decode("ascii"),"dr_created_by":current_user,
-                    "dr_created_at":datetime.now().isoformat(),"receiving_remarks":remarks.strip()})
-            st.success("Direct Dispatch DRs generated and saved for all branches."); st.rerun()
-        except Exception as exc: st.error(str(exc))
-    if all(x.get("dr_no") for x in br):
-        if st.button("RELEASE BATCH FOR RECEIVING",type="primary",use_container_width=True,key=f"dd_release_recv_{batch}"):
+        st.error(f"Could not load Direct Dispatch records: {exc}")
+        return
+
+    # Keep batches that still have at least one confirmed branch needing a DR,
+    # or a generated DR that has not yet been released for receiving.
+    eligible_rows = [x for x in rows if str(x.get("batch_no") or "").strip() and (
+        str(x.get("allocation_confirmation") or "").strip().upper() == "CONFIRMED"
+        or (x.get("dr_no") and not x.get("released_for_receiving_at"))
+    )]
+    batches = sorted({str(x.get("batch_no")) for x in eligible_rows}, reverse=True)
+    if not batches:
+        st.info("No confirmed Direct Dispatch allocation is waiting for DR generation.")
+        return
+
+    batch = st.selectbox("Direct Dispatch Batch", batches, key="dd_dr_batch")
+    br = [x for x in rows if str(x.get("batch_no")) == batch]
+    st.dataframe(pd.DataFrame([{
+        "Branch": x.get("branch"),
+        "Category": x.get("category"),
+        "Status": x.get("status"),
+        "Allocation Confirmation": x.get("allocation_confirmation") or "Pending",
+        "DR No.": x.get("dr_no") or "Not Generated"
+    } for x in br]), use_container_width=True, hide_index=True)
+
+    confirmed = [x for x in br if str(x.get("allocation_confirmation") or "").strip().upper() == "CONFIRMED"]
+    waiting = [x for x in confirmed if not x.get("dr_no")]
+
+    if not confirmed:
+        st.warning("No branch in this batch has confirmed its allocation yet.")
+        return
+
+    if waiting:
+        waiting_ids = {int(x["id"]) for x in waiting}
+        options = [f"{x['branch']} — {x['category']}" for x in waiting]
+        selected_labels = st.multiselect(
+            "Confirmed Branches to Generate *",
+            options,
+            default=options,
+            key=f"dd_generate_branches_{batch}"
+        )
+        selected = [x for x in waiting if f"{x['branch']} — {x['category']}" in selected_labels and int(x["id"]) in waiting_ids]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            base_dr = st.text_input("DR Base No. *", value=batch, key=f"dd_base_{batch}")
+            store_origin = st.text_input("Store Origin *", value="MAIN STORE", key=f"dd_origin_{batch}")
+            prepared_by = st.text_input("Prepared By *", value=current_user, key=f"dd_prep_{batch}")
+            delivery_date = st.date_input("Delivery Date *", value=date.today(), key=f"dd_date_{batch}")
+        with c2:
+            delivered_by = st.text_input("Delivered By / Driver *", key=f"dd_driver_{batch}")
+            approved_by = st.text_input("Approved By *", value="Glady Clemente/ Coleen Navaro", key=f"dd_approve_{batch}")
+            remarks = st.text_area("Remarks", key=f"dd_rem_{batch}", height=70)
+
+        required = bool(selected) and bool(base_dr.strip()) and bool(store_origin.strip()) and bool(prepared_by.strip()) and bool(delivered_by.strip()) and bool(approved_by.strip())
+
+        if st.button(
+            "GENERATE & SAVE DIRECT DISPATCH DRs",
+            type="primary",
+            use_container_width=True,
+            disabled=not required,
+            key=f"dd_save_{batch}"
+        ):
+            import base64
             try:
-                _warehouse_delivery_rpc("warehouse_release_direct_for_receiving",{"p_batch_no":batch,"p_actor":current_user})
-                st.success("DRs released. Branches can now input Actual Received."); st.rerun()
-            except Exception as exc: st.error(str(exc))
+                generated = 0
+                for d in selected:
+                    lines = _sb_request("warehouse_direct_dispatch_lines", "GET", params={
+                        "select": "item_id,quantity_released",
+                        "dispatch_id": f"eq.{d['id']}",
+                        "order": "id.asc"
+                    })
+                    if not lines:
+                        raise RuntimeError(f"{d['branch']} has no Direct Dispatch items to place on the DR.")
+
+                    ids = [str(x["item_id"]) for x in lines]
+                    item_map = {}
+                    if ids:
+                        item_rows = _sb_request("warehouse_items", "GET", params={
+                            "select": "id,name",
+                            "id": "in.(" + ",".join(ids) + ")"
+                        })
+                        item_map = {str(x["id"]): x["name"] for x in item_rows}
+
+                    single_payload = {
+                        "branch": d["branch"],
+                        "items": [
+                            (item_map.get(str(x["item_id"]), str(x["item_id"])), float(x.get("quantity_released") or 0))
+                            for x in lines
+                        ]
+                    }
+                    final_no = dr_no_text(base_dr, delivery_date, d["branch"])
+                    pdf = build_single_pdf(
+                        single_payload, d["category"], base_dr, store_origin,
+                        prepared_by, delivered_by, delivery_date,
+                        approved_by, current_user, None
+                    )
+                    _sb_request("warehouse_direct_dispatches", "PATCH", params={"id": f"eq.{d['id']}"}, payload={
+                        "dr_no": final_no,
+                        "dr_filename": f"DR_{safe_filename(final_no)}_{safe_filename(d['branch'])}.pdf",
+                        "dr_pdf_base64": base64.b64encode(pdf).decode("ascii"),
+                        "dr_created_by": current_user,
+                        "dr_created_at": datetime.now().isoformat(),
+                        "receiving_remarks": remarks.strip()
+                    })
+                    generated += 1
+                st.success(f"Generated and saved {generated} Direct Dispatch DR(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not generate Direct Dispatch DR: {exc}")
+    else:
+        st.success("All confirmed branches in this batch already have a generated DR.")
+
+    # Release remains batch-based. It appears only after every dispatch in the
+    # batch that needs receiving has a DR number.
+    refreshed = [x for x in br]
+    all_confirmed_have_dr = bool(confirmed) and all(x.get("dr_no") for x in confirmed)
+    pending_unconfirmed = [x for x in br if str(x.get("allocation_confirmation") or "").strip().upper() != "CONFIRMED"]
+    if all_confirmed_have_dr and not pending_unconfirmed:
+        if st.button("RELEASE BATCH FOR RECEIVING", type="primary", use_container_width=True, key=f"dd_release_recv_{batch}"):
+            try:
+                _warehouse_delivery_rpc("warehouse_release_direct_for_receiving", {"p_batch_no": batch, "p_actor": current_user})
+                st.success("DRs released. Branches can now input Actual Received.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not release Direct Dispatch batch: {exc}")
+    elif pending_unconfirmed:
+        st.info("Confirmed branches can already have their DR generated. Batch release will become available after the remaining branches confirm and have DRs.")
 
 def direct_dispatch_receiving_overview():
-    st.markdown("### Direct Dispatch Receiving Overview")
+    st.markdown("### Direct Dispatch Receiving")
+    st.caption("Same completion workflow as Order Request: review by batch, select received branches, then mark them done together.")
     try:
         rows=_sb_request("warehouse_direct_dispatch_overview","GET",params={"select":"*","order":"id.desc"})
     except Exception as exc:
         st.error(str(exc)); return
+
     if current_role=="Admin":
         assigned=str(st.session_state.get("branch","")).replace(" Warehouse","").strip().casefold()
         rows=[x for x in rows if str(x.get("warehouse","")).replace(" Warehouse","").strip().casefold()==assigned]
-    if not rows: st.info("No Direct Dispatch receiving records."); return
-    df=pd.DataFrame(rows)
-    show=[c for c in ["batch_no","dispatch_no","warehouse","branch","category","dr_no","released_qty","received_qty","variance","allocation_confirmation","status","receiving_proof_name"] if c in df.columns]
-    st.dataframe(df[show],use_container_width=True,hide_index=True)
-    labels=[f"{x.get('dispatch_no')} — {x.get('branch')} — {x.get('status')}" for x in rows]
-    pick=st.selectbox("View Direct Dispatch Receiving",labels,key=f"dd_overview_{current_role}")
-    d=rows[labels.index(pick)]
-    if d.get("receiving_remarks"): st.write(f"**Receiving Remarks / Variance Explanation:** {d['receiving_remarks']}")
-    if d.get("receiving_proof_name"): st.write(f"**Proof:** {d['receiving_proof_name']}")
+    if not rows:
+        st.info("No Direct Dispatch receiving records."); return
+
+    # Filing migration defaults old/current records to ACTIVE.
+    active=[x for x in rows if str(x.get("filing_status") or "ACTIVE").upper()!="FILED"]
+    filed=[x for x in rows if str(x.get("filing_status") or "ACTIVE").upper()=="FILED"]
+    tab_active,tab_filed=st.tabs(["ACTIVE / RECEIVING","COMPLETED / FILING"])
+
+    with tab_active:
+        if not active:
+            st.info("No active Direct Dispatch receiving records.")
+        else:
+            batches=sorted({str(x.get("batch_no") or x.get("dispatch_no") or "") for x in active},reverse=True)
+            batch=st.selectbox("Direct Dispatch Batch",batches,key=f"dd_recv_batch_{current_role}")
+            view=[x for x in active if str(x.get("batch_no") or x.get("dispatch_no") or "")==batch]
+            df=pd.DataFrame(view)
+            show=[c for c in ["dispatch_no","warehouse","branch","category","dr_no","released_qty","received_qty","variance","status","receiving_proof_name"] if c in df.columns]
+            st.dataframe(df[show],use_container_width=True,hide_index=True)
+
+            # Match Order Request: received/completed branches can be selected together and filed in one action.
+            received=[x for x in view if str(x.get("status") or "").upper()=="COMPLETED"]
+            variance=[x for x in view if str(x.get("status") or "").upper()=="WITH_VARIANCE"]
+            waiting=[x for x in view if str(x.get("status") or "").upper() not in ("COMPLETED","WITH_VARIANCE")]
+
+            st.markdown("### Complete received branches")
+            if not received:
+                st.info("No completed receiving records in this batch are ready to mark done.")
+            else:
+                options={f"{x.get('branch')} — {x.get('dr_no') or x.get('dispatch_no')} (#{int(x['id'])})":int(x['id']) for x in received}
+                all_received=st.checkbox("Select All Received",key=f"dd_all_received_{batch}_{current_role}")
+                selected=list(options) if all_received else st.multiselect("Select received branches",list(options),key=f"dd_bulk_received_{batch}_{current_role}")
+                confirm=st.checkbox("Confirm completion of the selected received Direct Dispatch deliveries",key=f"dd_confirm_received_{batch}_{current_role}")
+                if st.button("✅ CONFIRM SELECTED DONE DELIVERY",type="primary",use_container_width=True,
+                             disabled=not selected or not confirm,key=f"dd_complete_received_{batch}_{current_role}"):
+                    completed=[]; failed=[]
+                    for label in selected:
+                        did=options[label]
+                        try:
+                            _warehouse_delivery_rpc("warehouse_mark_direct_dispatch_done",{"p_dispatch_id":did,"p_actor":current_user})
+                            completed.append(did)
+                        except Exception as exc:
+                            failed.append(f"#{did}: {exc}")
+                    if completed:
+                        st.success(f"{len(completed)} Direct Dispatch delivery/deliveries marked done and moved to Completed / Filing.")
+                    if failed:
+                        st.error("Some records could not be completed: " + " | ".join(failed))
+                    if completed: st.rerun()
+
+            st.markdown("### Variances waiting for review")
+            if variance:
+                st.warning(f"{len(variance)} branch(es) have receiving variances. Resolve the variance first; after resolution they will become available under Complete received branches.")
+                vdf=pd.DataFrame(variance)
+                vshow=[c for c in ["dispatch_no","branch","dr_no","released_qty","received_qty","variance","receiving_remarks","receiving_proof_name","status"] if c in vdf.columns]
+                st.dataframe(vdf[vshow],use_container_width=True,hide_index=True)
+            else:
+                st.info("No unresolved receiving variances in this batch.")
+
+            st.markdown("### Branches waiting for receiving")
+            if waiting:
+                wdf=pd.DataFrame(waiting)
+                wshow=[c for c in ["dispatch_no","branch","dr_no","allocation_confirmation","status"] if c in wdf.columns]
+                st.dataframe(wdf[wshow],use_container_width=True,hide_index=True)
+            else:
+                st.info("No branches are waiting to submit receiving in this batch.")
+
+            st.divider()
+            st.markdown("### View active Direct Dispatch details")
+            detail_options={f"{x.get('branch')} — {x.get('dr_no') or x.get('dispatch_no')} — {x.get('status')} (#{int(x['id'])})":int(x['id']) for x in view}
+            choice=st.selectbox("View branch delivery",list(detail_options),key=f"dd_active_detail_{batch}_{current_role}")
+            rec=next(x for x in view if int(x["id"])==detail_options[choice])
+            if rec.get("receiving_remarks"): st.write(f"**Receiving Remarks / Variance Explanation:** {rec['receiving_remarks']}")
+            if rec.get("receiving_proof_name"): st.write(f"**Proof:** {rec['receiving_proof_name']}")
+            if rec.get("dr_pdf_base64"):
+                try:
+                    import base64
+                    st.download_button("📄 DOWNLOAD DELIVERY RECEIPT",base64.b64decode(rec["dr_pdf_base64"]),
+                        file_name=rec.get("dr_filename") or f"{rec.get('dr_no') or rec.get('dispatch_no')}.pdf",
+                        mime="application/pdf",use_container_width=True,key=f"dd_active_dr_{rec['id']}")
+                except Exception: pass
+
+    with tab_filed:
+        if not filed:
+            st.info("No completed Direct Dispatch deliveries filed yet.")
+        else:
+            fdf=pd.DataFrame(filed)
+            show=[c for c in ["marked_done_at","batch_no","dispatch_no","warehouse","branch","category","dr_no","released_qty","received_qty","variance","received_by","marked_done_by"] if c in fdf.columns]
+            st.dataframe(fdf[show],use_container_width=True,hide_index=True)
+            labels=[f"{x.get('batch_no')} — {x.get('branch')} — {x.get('dr_no') or x.get('dispatch_no')}" for x in filed]
+            pick=st.selectbox("View completed Direct Dispatch",labels,key=f"dd_filed_detail_{current_role}")
+            rec=filed[labels.index(pick)]
+            st.write(f"**Batch:** {rec.get('batch_no') or '—'} | **Branch:** {rec.get('branch') or '—'} | **DR:** {rec.get('dr_no') or '—'}")
+            st.write(f"**Received by:** {rec.get('received_by') or 'Not recorded'} | **Marked done by:** {rec.get('marked_done_by') or 'Not recorded'}")
+            if rec.get("receiving_remarks"): st.write(f"**Receiving Remarks / Variance Explanation:** {rec['receiving_remarks']}")
+            if rec.get("receiving_proof_name"): st.write(f"**Proof:** {rec['receiving_proof_name']}")
+            if rec.get("dr_pdf_base64"):
+                try:
+                    import base64
+                    st.download_button("📄 DOWNLOAD DELIVERY RECEIPT",base64.b64decode(rec["dr_pdf_base64"]),
+                        file_name=rec.get("dr_filename") or f"{rec.get('dr_no') or rec.get('dispatch_no')}.pdf",
+                        mime="application/pdf",use_container_width=True,key=f"dd_filed_dr_{rec['id']}")
+                except Exception: pass
 
 def viewer_portal():
     st.markdown("## Viewer Dashboard")
@@ -3397,13 +3579,55 @@ def warehouse_deliveries_admin():
 from warehouse_inventory import render_warehouse_inventory
 
 if current_role == "Super Admin":
-    st.sidebar.markdown("#### Operations")
-    mode = st.sidebar.radio("System Menu", [
-        "Dashboard", "Orders & Allocation", "Receiving & Variances", "Direct Dispatch Receiving", "Deliveries",
-        "Warehouse Inventory", "Warehouse Deliveries", "Stock Count Requests",
-        "Delivery Receipt Generator", "Transaction History", "User Management",
-        "Database Backup", "Settings"
-    ], label_visibility="collapsed")
+    # Organized Super Admin navigation. Keep one session-state value so moving
+    # between sections does not change any of the existing page functions.
+    super_admin_sections = {
+        "OPERATIONS": [
+            "Dashboard",
+            "Orders & Allocation",
+            "Receiving & Variances",
+            "Direct Dispatch Receiving",
+            "Deliveries",
+        ],
+        "WAREHOUSE": [
+            "Warehouse Inventory",
+            "Warehouse Deliveries",
+            "Stock Count Requests",
+            "Delivery Receipt Generator",
+        ],
+        "RECORDS": [
+            "Transaction History",
+        ],
+        "ADMINISTRATION": [
+            "User Management",
+            "Database Backup",
+            "Settings",
+        ],
+    }
+
+    if "super_admin_mode" not in st.session_state:
+        st.session_state["super_admin_mode"] = "Dashboard"
+
+    # Compact section headings + navigation buttons make the long menu easier
+    # to scan while preserving the exact existing page names below.
+    for section_name, section_pages in super_admin_sections.items():
+        st.sidebar.markdown(
+            f"<div style='font-size:0.72rem;font-weight:800;letter-spacing:.12em;"
+            f"color:#765843;margin:16px 0 5px 2px;'>{section_name}</div>",
+            unsafe_allow_html=True,
+        )
+        for page_name in section_pages:
+            selected = st.session_state["super_admin_mode"] == page_name
+            if st.sidebar.button(
+                page_name,
+                key=f"super_nav_{page_name}",
+                use_container_width=True,
+                type="primary" if selected else "secondary",
+            ):
+                st.session_state["super_admin_mode"] = page_name
+                st.rerun()
+
+    mode = st.session_state["super_admin_mode"]
     if mode == "Dashboard":
         st.markdown("## Super Admin Dashboard"); render_daily_brew()
         with db_conn() as c:
