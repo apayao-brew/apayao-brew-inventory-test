@@ -2147,83 +2147,196 @@ def staff_orders():
 def my_orders():
     staff_orders()
 
-def receive_delivery():
-    st.markdown("## Receive Delivery")
-    branch=branch_for_user(); st.caption(f"Branch: {branch}")
-    with db_conn() as c:
-        dels=pd.read_sql_query("""SELECT d.id,d.delivery_no,d.cycle_branch_id,oc.order_no,oc.category,d.created_at,d.dr_pdf,d.dr_filename
-          FROM deliveries_v2 d JOIN order_cycle_branches cb ON cb.id=d.cycle_branch_id
-          JOIN order_cycles oc ON oc.id=cb.cycle_id WHERE cb.branch=? AND d.status='For Receiving' ORDER BY d.id DESC""",c,params=(branch,))
-    if dels.empty: st.info("No delivery waiting for receiving."); return
-    label=st.selectbox("Select Delivery",dels.delivery_no.tolist()); rec=dels[dels.delivery_no==label].iloc[0]
-    st.markdown(f"### {rec.order_no} • {label}")
+def receive_direct_dispatch():
+    branch=branch_for_user()
+    try:
+        dispatches=_sb_request("warehouse_direct_dispatches","GET",params={
+            "select":"id,dispatch_no,warehouse_id,branch,category,source,reference,remarks,status,released_at",
+            "branch":f"eq.{branch}",
+            "status":"eq.IN_TRANSIT",
+            "order":"released_at.desc"
+        })
+    except Exception as exc:
+        st.error(f"Could not load Direct Dispatch receiving: {exc}")
+        return
 
-    # Exact DR generated and saved by Super Admin.
-    if rec.dr_pdf is not None:
-        pdf_bytes=bytes(rec.dr_pdf)
-        st.download_button("📄 VIEW / DOWNLOAD DELIVERY RECEIPT",data=pdf_bytes,
-            file_name=(rec.dr_filename or f"DR_{safe_filename(label)}_{safe_filename(branch)}.pdf"),
-            mime="application/pdf",use_container_width=True)
-    else:
-        st.info("The DR PDF has not been saved to this delivery yet. Super Admin can regenerate it and click SAVE DR DETAILS.")
+    if not dispatches:
+        st.info("No Direct Dispatch allocation waiting for receiving.")
+        return
 
-    with db_conn() as c:
-        items=pd.read_sql_query("SELECT item,ordered,delivered,received FROM branch_order_items WHERE cycle_branch_id=? ORDER BY id",c,params=(int(rec.cycle_branch_id),))
-    for col in ['ordered','delivered']:
-        items[col]=pd.to_numeric(items[col],errors='coerce').fillna(0)
-    show=items[['item','ordered','delivered']].copy(); show.columns=['Item','Ordered','DR Qty / To Deliver']
-    st.markdown("#### Finalized Delivery Reference")
-    st.dataframe(show,use_container_width=True,hide_index=True)
-    st.markdown("#### Actual Receiving / Tally")
-    st.caption("Enter the quantity physically received for every item. Enter 0 if none was received. DR Qty is read-only.")
+    labels=[f"{d['dispatch_no']} — {d['category']}" for d in dispatches]
+    chosen=st.selectbox("Select Direct Dispatch",labels,key="branch_direct_dispatch_select")
+    d=dispatches[labels.index(chosen)]
 
+    try:
+        lines=_sb_request("warehouse_direct_dispatch_lines","GET",params={
+            "select":"id,item_id,quantity_released,quantity_received,variance,receiving_remarks",
+            "dispatch_id":f"eq.{d['id']}",
+            "order":"id.asc"
+        })
+        item_ids=[str(x["item_id"]) for x in lines]
+        item_map={}
+        if item_ids:
+            item_rows=_sb_request("warehouse_items","GET",params={
+                "select":"id,name,unit",
+                "id":"in.("+",".join(item_ids)+")"
+            })
+            item_map={str(x["id"]):x for x in item_rows}
+    except Exception as exc:
+        st.error(f"Could not load dispatch items: {exc}")
+        return
+
+    st.markdown(f"### {d['dispatch_no']} • {d['category']}")
+    st.caption(f"Source: {d.get('source') or 'Direct Dispatch'} • Reference: {d.get('reference') or '—'}")
     rows=[]; incomplete=False
     h1,h2,h3,h4=st.columns([3,1,1,1])
-    h1.markdown("**Item**"); h2.markdown("**DR Qty**"); h3.markdown("**Actual Received**"); h4.markdown("**Variance**")
-    for idx,r in items.iterrows():
+    h1.markdown("**Item**"); h2.markdown("**Released**"); h3.markdown("**Actual Received**"); h4.markdown("**Variance**")
+    for idx,line in enumerate(lines):
+        meta=item_map.get(str(line["item_id"]),{})
+        item_name=meta.get("name",str(line["item_id"]))
+        released=float(line.get("quantity_released") or 0)
         c1,c2,c3,c4=st.columns([3,1,1,1])
-        c1.write(str(r['item'])); c2.write(f"{float(r['delivered']):g}")
-        val=c3.number_input("Actual Received",min_value=0.0,step=1.0,value=None,key=f"recv_qty_{int(rec.id)}_{idx}",label_visibility="collapsed")
-        if val is None:
+        c1.write(item_name); c2.write(f"{released:g}")
+        actual=c3.number_input("Actual Received",min_value=0.0,step=1.0,value=None,
+            key=f"direct_recv_{d['id']}_{line['id']}",label_visibility="collapsed")
+        if actual is None:
             incomplete=True; variance=None; c4.write("—")
         else:
-            variance=float(val)-float(r['delivered']); c4.write(f"{variance:+g}" if variance else "0")
-        rows.append({'Item':r['item'],'DR / Delivered':float(r['delivered']),'Actual Received':val,'Variance':variance})
+            variance=float(actual)-released
+            c4.write(f"{variance:+g}" if variance else "0")
+        rows.append({"line_id":int(line["id"]),"Item":item_name,"Released":released,
+                     "Actual Received":actual,"Variance":variance})
 
     entry=pd.DataFrame(rows)
-    hasvar=entry['Variance'].notna().any() and (entry['Variance'].dropna()!=0).any()
-    remarks=st.text_area("Explanation / reason *" if hasvar else "Remarks (optional)",key=f"recv_remarks_{int(rec.id)}")
-    proof=st.file_uploader("Proof/photo *",type=['png','jpg','jpeg','pdf'],key=f"recv_proof_{int(rec.id)}") if hasvar else None
-    if hasvar: st.warning("Variance detected. Explanation and proof are required before submission.")
+    has_variance=entry["Variance"].notna().any() and (entry["Variance"].dropna()!=0).any()
+    remarks=st.text_area("Explanation / reason *" if has_variance else "Remarks (optional)",
+                         key=f"direct_recv_remarks_{d['id']}")
+    if has_variance:
+        st.warning("Variance detected. Explanation is required. This dispatch will be sent FOR REVIEW and warehouse stock will not be finally deducted yet.")
 
-    if st.button("REVIEW RECEIVING",type="primary",use_container_width=True):
+    if st.button("REVIEW DIRECT DISPATCH RECEIVING",type="primary",use_container_width=True,
+                 key=f"review_direct_recv_{d['id']}"):
         if incomplete:
-            st.error("Receiving incomplete. Enter Actual Received for every item. Enter 0 if none was received."); return
-        if hasvar and (not remarks.strip() or proof is None):
-            st.error("Variance detected. Explanation and proof are required."); return
-        st.session_state[f"recv_{int(rec.id)}"]={
-            'rows':entry.to_dict('records'),'remarks':remarks,
-            'proof_name':proof.name if proof else '',
-            'proof_data':proof.getvalue() if proof else None,
-            'proof_mime':proof.type if proof else ''}
-        st.success("Review complete. Confirm below to submit the receiving record.")
+            st.error("Enter Actual Received for every item. Enter 0 if none was received.")
+        elif has_variance and not remarks.strip():
+            st.error("Enter an explanation for the variance.")
+        else:
+            st.session_state[f"direct_recv_review_{d['id']}"]={
+                "rows":entry.to_dict("records"),"remarks":remarks.strip()
+            }
+            st.success("Review complete. Confirm below to submit receiving.")
 
-    key=f"recv_{int(rec.id)}"
-    if key in st.session_state:
-        review=pd.DataFrame(st.session_state[key]['rows'])
+    review_key=f"direct_recv_review_{d['id']}"
+    if review_key in st.session_state:
+        review=pd.DataFrame(st.session_state[review_key]["rows"])
         st.markdown("##### Review")
-        st.dataframe(review,use_container_width=True,hide_index=True)
-        if st.button("CONFIRM & SUBMIT RECEIVING",type="primary",use_container_width=True):
-            data=st.session_state[key]; rows=pd.DataFrame(data['rows'])
-            hv=(pd.to_numeric(rows['Variance'],errors='coerce').fillna(0)!=0).any()
-            with db_conn() as c:
-                for _,r in rows.iterrows():
-                    c.execute("UPDATE branch_order_items SET received=? WHERE cycle_branch_id=? AND item=?",(float(r['Actual Received']),int(rec.cycle_branch_id),r['Item']))
-                status='Received - With Variance' if hv else 'Received - No Variance'
-                c.execute("UPDATE deliveries_v2 SET status=?,received_by=?,received_at=?,remarks=?,proof_name=?,proof_data=?,proof_mime=? WHERE id=?",
-                          (status,current_user,datetime.now().isoformat(timespec='seconds'),data['remarks'],data['proof_name'],data['proof_data'],data['proof_mime'],int(rec.id)))
-                c.execute("UPDATE order_cycle_branches SET status=? WHERE id=?",(status,int(rec.cycle_branch_id)))
-            st.session_state.pop(key,None); audit("DELIVERY_RECEIVED",f"{label}; variance={hv}"); st.success("Receiving submitted. It is now waiting for Super Admin review."); st.rerun()
+        st.dataframe(review[["Item","Released","Actual Received","Variance"]],
+                     use_container_width=True,hide_index=True)
+        if st.button("CONFIRM & SUBMIT DIRECT DISPATCH RECEIVING",type="primary",
+                     use_container_width=True,key=f"confirm_direct_recv_{d['id']}"):
+            payload=st.session_state[review_key]
+            received_rows=[
+                {"line_id":int(r["line_id"]),"quantity_received":float(r["Actual Received"])}
+                for r in payload["rows"]
+            ]
+            try:
+                _warehouse_delivery_rpc("warehouse_confirm_direct_receiving",{
+                    "p_dispatch_id":int(d["id"]),
+                    "p_rows":received_rows,
+                    "p_actor":current_user,
+                    "p_remarks":payload["remarks"]
+                })
+                st.session_state.pop(review_key,None)
+                if any(float(r["Variance"] or 0)!=0 for r in payload["rows"]):
+                    st.warning("Receiving submitted WITH VARIANCE. It is waiting for Admin review; final warehouse deduction has not been posted.")
+                else:
+                    st.success("Receiving confirmed. Direct Dispatch is COMPLETED and the warehouse stock has been deducted.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not submit Direct Dispatch receiving: {exc}")
+
+def receive_delivery():
+    st.markdown("## Receiving")
+    direct_tab, regular_tab = st.tabs(["Direct Dispatch", "Order / DR Receiving"])
+    with direct_tab:
+        receive_direct_dispatch()
+    with regular_tab:
+        st.markdown("### Order / DR Receiving")
+        branch=branch_for_user(); st.caption(f"Branch: {branch}")
+        with db_conn() as c:
+            dels=pd.read_sql_query("""SELECT d.id,d.delivery_no,d.cycle_branch_id,oc.order_no,oc.category,d.created_at,d.dr_pdf,d.dr_filename
+              FROM deliveries_v2 d JOIN order_cycle_branches cb ON cb.id=d.cycle_branch_id
+              JOIN order_cycles oc ON oc.id=cb.cycle_id WHERE cb.branch=? AND d.status='For Receiving' ORDER BY d.id DESC""",c,params=(branch,))
+        if dels.empty: st.info("No delivery waiting for receiving."); return
+        label=st.selectbox("Select Delivery",dels.delivery_no.tolist()); rec=dels[dels.delivery_no==label].iloc[0]
+        st.markdown(f"### {rec.order_no} • {label}")
+
+        # Exact DR generated and saved by Super Admin.
+        if rec.dr_pdf is not None:
+            pdf_bytes=bytes(rec.dr_pdf)
+            st.download_button("📄 VIEW / DOWNLOAD DELIVERY RECEIPT",data=pdf_bytes,
+                file_name=(rec.dr_filename or f"DR_{safe_filename(label)}_{safe_filename(branch)}.pdf"),
+                mime="application/pdf",use_container_width=True)
+        else:
+            st.info("The DR PDF has not been saved to this delivery yet. Super Admin can regenerate it and click SAVE DR DETAILS.")
+
+        with db_conn() as c:
+            items=pd.read_sql_query("SELECT item,ordered,delivered,received FROM branch_order_items WHERE cycle_branch_id=? ORDER BY id",c,params=(int(rec.cycle_branch_id),))
+        for col in ['ordered','delivered']:
+            items[col]=pd.to_numeric(items[col],errors='coerce').fillna(0)
+        show=items[['item','ordered','delivered']].copy(); show.columns=['Item','Ordered','DR Qty / To Deliver']
+        st.markdown("#### Finalized Delivery Reference")
+        st.dataframe(show,use_container_width=True,hide_index=True)
+        st.markdown("#### Actual Receiving / Tally")
+        st.caption("Enter the quantity physically received for every item. Enter 0 if none was received. DR Qty is read-only.")
+
+        rows=[]; incomplete=False
+        h1,h2,h3,h4=st.columns([3,1,1,1])
+        h1.markdown("**Item**"); h2.markdown("**DR Qty**"); h3.markdown("**Actual Received**"); h4.markdown("**Variance**")
+        for idx,r in items.iterrows():
+            c1,c2,c3,c4=st.columns([3,1,1,1])
+            c1.write(str(r['item'])); c2.write(f"{float(r['delivered']):g}")
+            val=c3.number_input("Actual Received",min_value=0.0,step=1.0,value=None,key=f"recv_qty_{int(rec.id)}_{idx}",label_visibility="collapsed")
+            if val is None:
+                incomplete=True; variance=None; c4.write("—")
+            else:
+                variance=float(val)-float(r['delivered']); c4.write(f"{variance:+g}" if variance else "0")
+            rows.append({'Item':r['item'],'DR / Delivered':float(r['delivered']),'Actual Received':val,'Variance':variance})
+
+        entry=pd.DataFrame(rows)
+        hasvar=entry['Variance'].notna().any() and (entry['Variance'].dropna()!=0).any()
+        remarks=st.text_area("Explanation / reason *" if hasvar else "Remarks (optional)",key=f"recv_remarks_{int(rec.id)}")
+        proof=st.file_uploader("Proof/photo *",type=['png','jpg','jpeg','pdf'],key=f"recv_proof_{int(rec.id)}") if hasvar else None
+        if hasvar: st.warning("Variance detected. Explanation and proof are required before submission.")
+
+        if st.button("REVIEW RECEIVING",type="primary",use_container_width=True):
+            if incomplete:
+                st.error("Receiving incomplete. Enter Actual Received for every item. Enter 0 if none was received."); return
+            if hasvar and (not remarks.strip() or proof is None):
+                st.error("Variance detected. Explanation and proof are required."); return
+            st.session_state[f"recv_{int(rec.id)}"]={
+                'rows':entry.to_dict('records'),'remarks':remarks,
+                'proof_name':proof.name if proof else '',
+                'proof_data':proof.getvalue() if proof else None,
+                'proof_mime':proof.type if proof else ''}
+            st.success("Review complete. Confirm below to submit the receiving record.")
+
+        key=f"recv_{int(rec.id)}"
+        if key in st.session_state:
+            review=pd.DataFrame(st.session_state[key]['rows'])
+            st.markdown("##### Review")
+            st.dataframe(review,use_container_width=True,hide_index=True)
+            if st.button("CONFIRM & SUBMIT RECEIVING",type="primary",use_container_width=True):
+                data=st.session_state[key]; rows=pd.DataFrame(data['rows'])
+                hv=(pd.to_numeric(rows['Variance'],errors='coerce').fillna(0)!=0).any()
+                with db_conn() as c:
+                    for _,r in rows.iterrows():
+                        c.execute("UPDATE branch_order_items SET received=? WHERE cycle_branch_id=? AND item=?",(float(r['Actual Received']),int(rec.cycle_branch_id),r['Item']))
+                    status='Received - With Variance' if hv else 'Received - No Variance'
+                    c.execute("UPDATE deliveries_v2 SET status=?,received_by=?,received_at=?,remarks=?,proof_name=?,proof_data=?,proof_mime=? WHERE id=?",
+                              (status,current_user,datetime.now().isoformat(timespec='seconds'),data['remarks'],data['proof_name'],data['proof_data'],data['proof_mime'],int(rec.id)))
+                    c.execute("UPDATE order_cycle_branches SET status=? WHERE id=?",(status,int(rec.cycle_branch_id)))
+                st.session_state.pop(key,None); audit("DELIVERY_RECEIVED",f"{label}; variance={hv}"); st.success("Receiving submitted. It is now waiting for Super Admin review."); st.rerun()
 
 def receiving_variances_admin():
     st.markdown("## Receiving & Variances")
