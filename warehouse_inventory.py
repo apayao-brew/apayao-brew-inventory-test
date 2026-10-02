@@ -135,7 +135,7 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
     except Exception as exc:
         st.error(str(exc)); return
 
-    tabs = st.tabs(['Stock Balance','Monday Stock Count','Item Masterlist','Dispatch History'])
+    tabs = st.tabs(['Stock Balance','Monday Stock Count','Item Masterlist','Direct Dispatch','Dispatch History'])
 
     with tabs[0]:
         st.subheader(f'{warehouse_name} — {category}')
@@ -315,9 +315,129 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
         else:
             st.info('No items yet for this warehouse/category.')
 
+
     with tabs[3]:
+        st.subheader(f'Direct Dispatch — {warehouse_name}')
+        st.caption('No branch order is required. Stock is reserved while IN TRANSIT and is deducted only after confirmed branch receiving.')
+
+        if category in ('Pastries','Store Items'):
+            st.info('Pastries and Store Items use the separate Buntun preparation/distribution workflow and are not posted through this regular Direct Dispatch screen.')
+        elif not items:
+            st.info('No items yet for this warehouse/category.')
+        else:
+            try:
+                reserved_rows = _request('warehouse_reserved_stock', params={
+                    'select':'item_id,reserved_quantity',
+                    'warehouse_id':'eq.'+warehouse_id
+                })
+                reserved_lookup = {str(r['item_id']): float(r.get('reserved_quantity') or 0) for r in reserved_rows}
+                balance_lookup = {str(r['item_id']): float(r.get('balance') or 0) for r in balances}
+
+                dispatch_rows = []
+                for item in items:
+                    item_id = str(item['id'])
+                    balance_qty = balance_lookup.get(item_id, 0.0)
+                    reserved_qty = reserved_lookup.get(item_id, 0.0)
+                    dispatch_rows.append({
+                        'Item ID': item_id,
+                        'Item': item['name'],
+                        'Unit': item['unit'],
+                        'Warehouse Stock': balance_qty,
+                        'Reserved / In Transit': reserved_qty,
+                        'Available to Dispatch': balance_qty - reserved_qty,
+                        'Qty to Dispatch': 0.0,
+                    })
+
+                branch = st.text_input('Branch', key='wh_direct_branch')
+                reference = st.text_input('Reference / DR No. (optional)', key='wh_direct_reference')
+                remarks = st.text_area('Remarks (optional)', key='wh_direct_remarks')
+
+                edited_dispatch = st.data_editor(
+                    pd.DataFrame(dispatch_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                    disabled=['Item ID','Item','Unit','Warehouse Stock','Reserved / In Transit','Available to Dispatch'],
+                    column_config={'Qty to Dispatch': st.column_config.NumberColumn('Qty to Dispatch', min_value=0.0, step=1.0, format='%.3f')},
+                    key='wh_direct_editor'
+                )
+
+                selected = edited_dispatch[pd.to_numeric(edited_dispatch['Qty to Dispatch'], errors='coerce').fillna(0) > 0].copy()
+                invalid_qty = any(
+                    float(r['Qty to Dispatch']) > float(r['Available to Dispatch'])
+                    for _, r in selected.iterrows()
+                ) if not selected.empty else False
+
+                if invalid_qty:
+                    st.error('A dispatch quantity is greater than the available stock after reservations.')
+
+                if st.button('CREATE DIRECT DISPATCH', type='primary',
+                             disabled=(not str(branch).strip() or selected.empty or invalid_qty),
+                             key='wh_direct_create'):
+                    dispatch_no = 'DD-' + datetime.now(TZ).strftime('%Y%m%d-%H%M%S-%f')
+                    rows_payload = [{'item_id': str(r['Item ID']), 'qty': float(r['Qty to Dispatch'])} for _, r in selected.iterrows()]
+                    _rpc('warehouse_create_direct_dispatch', {
+                        'p_dispatch_no': dispatch_no,
+                        'p_warehouse_id': warehouse_id,
+                        'p_branch': str(branch).strip(),
+                        'p_category': category,
+                        'p_reference': str(reference).strip(),
+                        'p_remarks': str(remarks).strip(),
+                        'p_rows': rows_payload,
+                        'p_actor': username
+                    })
+                    st.success(f'Direct Dispatch {dispatch_no} created FOR PREPARATION.')
+                    st.rerun()
+
+                st.markdown('#### For Preparation / In Transit')
+                active_dispatches = _request('warehouse_direct_dispatches', params={
+                    'select':'id,dispatch_no,branch,category,source,reference,remarks,status,created_by,created_at,released_by,released_at',
+                    'warehouse_id':'eq.'+warehouse_id,
+                    'category':'eq.'+category,
+                    'status':'in.(FOR_PREPARATION,IN_TRANSIT,WITH_VARIANCE)',
+                    'order':'created_at.desc',
+                    'limit':'100'
+                })
+
+                if not active_dispatches:
+                    st.info('No active Direct Dispatch records for this warehouse/category.')
+                else:
+                    item_names = {str(i['id']): i['name'] for i in items}
+                    for d in active_dispatches:
+                        with st.expander(f"{d['dispatch_no']} • {d['branch']} • {str(d['status']).replace('_',' ')}"):
+                            lines = _request('warehouse_direct_dispatch_lines', params={
+                                'select':'id,item_id,quantity_released,quantity_received,variance,receiving_remarks',
+                                'dispatch_id':'eq.'+str(d['id']),
+                                'order':'id.asc'
+                            })
+                            if lines:
+                                st.dataframe(pd.DataFrame([{
+                                    'Item': item_names.get(str(x['item_id']), str(x['item_id'])),
+                                    'Released': x.get('quantity_released'),
+                                    'Received': x.get('quantity_received'),
+                                    'Variance': x.get('variance'),
+                                    'Receiving Remarks': x.get('receiving_remarks')
+                                } for x in lines]), hide_index=True, use_container_width=True)
+
+                            st.caption(f"Reference: {d.get('reference') or '—'} • Created by: {d.get('created_by') or '—'}")
+
+                            if d.get('status') == 'FOR_PREPARATION':
+                                if st.button('MARK DISPATCHED / RELEASE TO BRANCH', key=f"wh_direct_release_{d['id']}"):
+                                    _rpc('warehouse_release_direct_dispatch', {
+                                        'p_dispatch_id': int(d['id']),
+                                        'p_actor': username
+                                    })
+                                    st.success('Released. Stock is reserved / in transit. It has NOT been deducted yet.')
+                                    st.rerun()
+                            elif d.get('status') == 'IN_TRANSIT':
+                                st.info('Waiting for branch receiving confirmation. Stock is reserved but not yet finally deducted.')
+                            elif d.get('status') == 'WITH_VARIANCE':
+                                st.warning('Branch receiving has a variance. Final completion/deduction requires variance resolution.')
+            except Exception as exc:
+                st.error(str(exc))
+
+    with tabs[4]:
         st.subheader(f'Dispatch History — {warehouse_name}')
-        st.caption('This shows finalized warehouse dispatch movements. Direct Dispatch detail will be connected in the next TEST UI step.')
+        st.caption('Final warehouse Pull Out appears only after branch receiving is confirmed. Active Direct Dispatch records remain in the Direct Dispatch tab.')
         try:
             item_rows=_request('warehouse_items',params={'select':'id,name,category','warehouse_id':'eq.'+warehouse_id})
             item_lookup={r['id']:r for r in item_rows}
