@@ -1939,7 +1939,13 @@ def staff_orders():
     pending=req[req.status=='Pending']
     if not pending.empty: st.warning(f"You have {len(pending)} order request(s) waiting for submission.")
     labels=[f"{r.order_no} — {r.category} — {r.status}" for _,r in req.iterrows()]
-    chosen=st.selectbox("Select Order Request",labels)
+    target_cb = st.session_state.pop("open_allocation_cycle_branch_id", None)
+    default_order_index = 0
+    if target_cb is not None:
+        matches = req.index[req["cycle_branch_id"].astype(int) == int(target_cb)].tolist()
+        if matches:
+            default_order_index = req.index.get_loc(matches[0])
+    chosen=st.selectbox("Select Order Request",labels,index=default_order_index)
     rec=req.iloc[labels.index(chosen)]
     st.markdown(f"### {rec.order_no}")
     st.write(f"**Branch:** {branch}  |  **Category:** {rec.category}")
@@ -2927,7 +2933,14 @@ def stock_count_staff():
         rows = _sb_get("stock_count_requests", id=rid)
         if rows: requests.append(rows[0])
     labels = [_stock_request_label(r) for r in requests]
-    chosen = st.selectbox("Select Stock Count Request", labels)
+    target_stock_request = st.session_state.pop("open_stock_count_request_id", None)
+    default_stock_index = 0
+    if target_stock_request is not None:
+        for idx, request_row in enumerate(requests):
+            if str(request_row.get("id")) == str(target_stock_request):
+                default_stock_index = idx
+                break
+    chosen = st.selectbox("Select Stock Count Request", labels, index=default_stock_index)
     req = requests[labels.index(chosen)]
     rid = req["id"]
     br_rec = next(r for r in branch_rows if r["request_id"] == rid)
@@ -3215,12 +3228,59 @@ elif current_role == "Admin":
 
 else:
     st.sidebar.markdown("#### Branch Operations")
-    mode=st.sidebar.radio("Branch Menu",["Dashboard","Orders","Receiving","Stock Count Requests","Delivery / Receiving History"], label_visibility="collapsed")
+    mode=st.sidebar.radio("Branch Menu",["Dashboard","Orders","Receiving","Stock Count Requests","Delivery / Receiving History"], label_visibility="collapsed", key="branch_menu_mode")
     if mode=="Dashboard":
         st.markdown(f"## {branch_for_user()} Branch Dashboard"); render_daily_brew()
+        branch = branch_for_user()
         with db_conn() as c:
-            n=c.execute("SELECT COUNT(*) FROM order_cycle_branches WHERE branch=? AND status='Pending'",(branch_for_user(),)).fetchone()[0]
-        if n: st.warning(f"You have {n} new order request(s) waiting for your input.")
+            n=c.execute("SELECT COUNT(*) FROM order_cycle_branches WHERE branch=? AND status='Pending'",(branch,)).fetchone()[0]
+            pending_allocations = c.execute("""
+                SELECT cb.id, oc.order_no, oc.category
+                FROM order_cycle_branches cb
+                JOIN order_cycles oc ON oc.id=cb.cycle_id
+                WHERE cb.branch=?
+                  AND COALESCE(cb.allocation_released,0)=1
+                  AND COALESCE(cb.allocation_confirmation,'Pending')!='Confirmed'
+                  AND COALESCE(oc.status,'Open')!='Successful'
+                  AND COALESCE(cb.status,'')!='Cancelled'
+                ORDER BY cb.id DESC
+            """,(branch,)).fetchall()
+
+        pending_stock_counts = []
+        try:
+            sc_branch_rows = _sb_request("stock_count_request_branches","GET",params={
+                "select":"*", "branch":f"eq.{branch}", "order":"id.desc"
+            })
+            for br_row in sc_branch_rows or []:
+                if str(br_row.get("status","")).lower() == "submitted":
+                    continue
+                req_rows = _sb_get("stock_count_requests", id=br_row.get("request_id"))
+                if req_rows and str(req_rows[0].get("status","")).lower() == "open":
+                    pending_stock_counts.append((br_row, req_rows[0]))
+        except Exception:
+            pending_stock_counts = []
+
+        if pending_allocations or pending_stock_counts:
+            st.markdown("### 🔔 Pending Actions")
+            for cb_id, order_no, category in pending_allocations:
+                c1,c2=st.columns([4,1])
+                c1.warning(f"Allocation waiting for approval — {order_no} • {category}")
+                if c2.button("Review Allocation",key=f"dash_alloc_{cb_id}",use_container_width=True):
+                    st.session_state["open_allocation_cycle_branch_id"]=int(cb_id)
+                    st.session_state["branch_menu_mode"]="Orders"
+                    st.rerun()
+            for br_row, req_row in pending_stock_counts:
+                rid=req_row.get("id")
+                c1,c2=st.columns([4,1])
+                c1.warning(f"Stock Count required — {req_row.get('request_no','Request')} • {req_row.get('category','')}")
+                if c2.button("Input Stock Count",key=f"dash_stock_{rid}",use_container_width=True):
+                    st.session_state["open_stock_count_request_id"]=rid
+                    st.session_state["branch_menu_mode"]="Stock Count Requests"
+                    st.rerun()
+        else:
+            st.success("✓ No pending actions.")
+
+        if n: st.info(f"You also have {n} new order request(s) waiting for your order input.")
     elif mode=="Orders":
         order_tab1, order_tab2 = st.tabs(["Order Requests", "My Orders"])
         with order_tab1: staff_orders()
