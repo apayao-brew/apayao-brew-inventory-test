@@ -500,6 +500,53 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
                     st.info('No active Direct Dispatch records for this warehouse/category.')
                 else:
                     item_names = {str(i['id']): i['name'] for i in items}
+
+                    preparation = [d for d in active_dispatches if d.get('status') == 'FOR_PREPARATION']
+                    if preparation:
+                        st.markdown('##### Bulk Release')
+                        prep_options = {
+                            f"{d['dispatch_no']} • {d['branch']}": int(d['id'])
+                            for d in preparation
+                        }
+                        release_all = st.checkbox(
+                            f"Select all FOR PREPARATION ({len(preparation)})",
+                            key=f"wh_direct_release_all_{warehouse_id}_{category}"
+                        )
+                        if release_all:
+                            selected_release_labels = list(prep_options.keys())
+                            st.caption(f"{len(selected_release_labels)} allocation(s) selected for release.")
+                        else:
+                            selected_release_labels = st.multiselect(
+                                'Select allocation(s) to release',
+                                options=list(prep_options.keys()),
+                                key=f"wh_direct_release_selected_{warehouse_id}_{category}"
+                            )
+
+                        if st.button(
+                            'RELEASE SELECTED TO BRANCHES',
+                            type='primary',
+                            disabled=not selected_release_labels,
+                            key=f"wh_direct_bulk_release_{warehouse_id}_{category}"
+                        ):
+                            released_count = 0
+                            errors = []
+                            for label in selected_release_labels:
+                                try:
+                                    _rpc('warehouse_release_direct_dispatch', {
+                                        'p_dispatch_id': prep_options[label],
+                                        'p_actor': username
+                                    })
+                                    released_count += 1
+                                except Exception as exc:
+                                    errors.append(f"{label}: {exc}")
+                            if released_count:
+                                st.success(f"{released_count} allocation(s) released to branches.")
+                            if errors:
+                                st.error("Some allocations could not be released:\n" + "\n".join(errors))
+                            st.rerun()
+
+                        st.divider()
+
                     for d in active_dispatches:
                         with st.expander(f"{d['dispatch_no']} • {d['branch']} • {str(d['status']).replace('_',' ')}"):
                             lines = _request('warehouse_direct_dispatch_lines', params={
