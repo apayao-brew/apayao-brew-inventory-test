@@ -2881,7 +2881,12 @@ def direct_dispatch_dr_generator():
     } for x in br]), use_container_width=True, hide_index=True)
 
     confirmed = [x for x in br if str(x.get("allocation_confirmation") or "").strip().upper() == "CONFIRMED"]
-    waiting = [x for x in confirmed if not x.get("dr_no") or not x.get("dr_pdf_base64")]
+
+    def _dd_has_saved_pdf(row):
+        value = row.get("dr_pdf_base64")
+        return isinstance(value, str) and len(value.strip()) > 100
+
+    waiting = [x for x in confirmed if not x.get("dr_no") or not _dd_has_saved_pdf(x)]
 
     if not confirmed:
         st.warning("No branch in this batch has confirmed its allocation yet.")
@@ -2968,30 +2973,31 @@ def direct_dispatch_dr_generator():
     else:
         st.success("All confirmed branches in this batch already have a generated DR.")
 
-    # Always show saved DRs for this batch so Super Admin/Admin can download
-    # them again after generation or after a page refresh.
-    saved_drs = [x for x in br if x.get("dr_no") and x.get("dr_pdf_base64")]
+    # Always show downloadable DR PDFs for confirmed branches in this batch.
+    saved_drs = [x for x in confirmed if x.get("dr_no") and _dd_has_saved_pdf(x)]
     if saved_drs:
         st.markdown("#### Generated Delivery Receipts")
         import base64
         for x in saved_drs:
             try:
-                pdf_bytes = base64.b64decode(x["dr_pdf_base64"])
+                pdf_bytes = base64.b64decode(str(x["dr_pdf_base64"]).strip(), validate=True)
+                if not pdf_bytes.startswith(b"%PDF"):
+                    raise ValueError("Saved data is not a valid PDF.")
                 st.download_button(
-                    f"⬇️ DOWNLOAD DR — {x.get('branch')} — {x.get('dr_no')}",
+                    label=f"⬇️ DOWNLOAD DR — {x.get('branch')} — {x.get('dr_no')}",
                     data=pdf_bytes,
                     file_name=x.get("dr_filename") or f"DR_{safe_filename(x.get('dr_no'))}_{safe_filename(x.get('branch'))}.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                     key=f"dd_download_saved_{x['id']}"
                 )
-            except Exception as exc:
-                st.warning(f"Saved DR for {x.get('branch')} could not be opened: {exc}")
+            except Exception:
+                st.error(f"{x.get('branch')}: the saved DR PDF is invalid. Regenerate this DR before releasing the batch.")
 
     # Release remains batch-based. It appears only after every dispatch in the
     # batch that needs receiving has a DR number.
     refreshed = [x for x in br]
-    all_confirmed_have_dr = bool(confirmed) and all(x.get("dr_no") and x.get("dr_pdf_base64") for x in confirmed)
+    all_confirmed_have_dr = bool(confirmed) and all(x.get("dr_no") and _dd_has_saved_pdf(x) for x in confirmed)
     pending_unconfirmed = [x for x in br if str(x.get("allocation_confirmation") or "").strip().upper() != "CONFIRMED"]
     if all_confirmed_have_dr and not pending_unconfirmed:
         if st.button("RELEASE BATCH FOR RECEIVING", type="primary", use_container_width=True, key=f"dd_release_recv_{batch}"):
