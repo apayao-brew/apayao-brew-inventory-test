@@ -2991,45 +2991,240 @@ def daily_brew_message():
 def render_daily_brew():
     st.markdown(f"""<div style='background:#FBF7F2;border:1px solid #E4D8CD;border-radius:16px;padding:18px 20px;margin:8px 0 18px 0'><b style='color:#3C271B'>☕ Kape Reminder of the Day</b><br><span style='color:#5A3F2D;font-size:1.05rem'>{daily_brew_message()}</span></div>""",unsafe_allow_html=True)
 
+
+# ========================= SUPER ADMIN — WAREHOUSE DELIVERIES (TEST) =========================
+WAREHOUSE_DELIVERY_CATEGORIES = {
+    "Buntun": ["Powders", "Torani", "Pastries", "Store Items"],
+    "Echague": ["Cups & Lids", "Powders"],
+    "Santa Maria": ["Cups & Lids", "Powders"],
+}
+
+
+def _warehouse_delivery_rpc(name, payload):
+    return _sb_request(f"rpc/{name}", "POST", payload=payload)
+
+
+def _warehouse_delivery_warehouses():
+    rows = _sb_request("warehouses", "GET", params={"select":"id,name", "active":"eq.true", "order":"name.asc"})
+    return {r["name"]: r["id"] for r in rows if r.get("name") in WAREHOUSE_DELIVERY_CATEGORIES}
+
+
+def _warehouse_delivery_items(warehouse_id, category):
+    return _sb_request("warehouse_items", "GET", params={
+        "select":"id,name,unit,category,warehouse_id", "warehouse_id":f"eq.{warehouse_id}",
+        "category":f"eq.{category}", "active":"eq.true", "order":"name.asc"
+    })
+
+
+def _next_warehouse_delivery_no():
+    return "WD-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def warehouse_deliveries_admin():
+    if current_role != "Super Admin":
+        st.error("Warehouse Deliveries is available to Super Admin only.")
+        return
+
+    st.markdown("## Warehouse Deliveries")
+    st.caption("TEST VERSION • Record supplier deliveries, inventory receiving, payments, and supporting-file records by warehouse.")
+    tab_new, tab_history, tab_accounting, tab_files = st.tabs([
+        "New Delivery", "Delivery History", "Payment & Accounting", "Files"
+    ])
+
+    try:
+        warehouse_map = _warehouse_delivery_warehouses()
+    except Exception as exc:
+        st.error(str(exc)); return
+    if not warehouse_map:
+        st.error("No active TEST warehouses were found."); return
+
+    with tab_new:
+        st.markdown("### Record New Warehouse Delivery")
+        warehouse_name = st.selectbox("Warehouse *", list(warehouse_map), key="wd_new_warehouse")
+        category = st.selectbox("Category *", WAREHOUSE_DELIVERY_CATEGORIES[warehouse_name], key="wd_new_category")
+        warehouse_id = warehouse_map[warehouse_name]
+        if category in ("Pastries", "Store Items"):
+            st.warning("Buntun Pastries and Store Items use the dedicated Receive → Dispatch → Reconcile workflow. Normal warehouse confirmation is blocked here to prevent double posting.")
+            return_from_special = True
+        else:
+            return_from_special = False
+
+        supplier = st.text_input("Supplier *", key="wd_supplier").strip()
+        delivery_date = st.date_input("Delivery Date *", value=date.today(), key="wd_date")
+        dr_invoice = st.text_input("DR / Invoice No.", key="wd_invoice").strip()
+        remarks = st.text_area("Remarks", key="wd_remarks").strip()
+
+        try:
+            item_rows = _warehouse_delivery_items(warehouse_id, category)
+        except Exception as exc:
+            st.error(str(exc)); item_rows=[]
+        if not item_rows:
+            st.info("No active items in this warehouse/category Item Masterlist.")
+        else:
+            entry = pd.DataFrame([{
+                "Item ID": r["id"], "Item": r["name"], "Unit": r.get("unit", ""),
+                "Quantity": 0.0, "Unit Cost": 0.0
+            } for r in item_rows])
+            edited = st.data_editor(
+                entry, hide_index=True, use_container_width=True,
+                disabled=["Item ID", "Item", "Unit"],
+                column_config={
+                    "Quantity": st.column_config.NumberColumn("Quantity", min_value=0.0, step=1.0),
+                    "Unit Cost": st.column_config.NumberColumn("Unit Cost", min_value=0.0, step=0.01, format="₱ %.2f"),
+                }, key=f"wd_editor_{warehouse_name}_{category}"
+            )
+            edited["Line Total"] = pd.to_numeric(edited["Quantity"], errors="coerce").fillna(0) * pd.to_numeric(edited["Unit Cost"], errors="coerce").fillna(0)
+            active = edited[pd.to_numeric(edited["Quantity"], errors="coerce").fillna(0) > 0].copy()
+            st.metric("Delivery Total", f"₱{active['Line Total'].sum():,.2f}")
+            confirm = st.checkbox("I reviewed the supplier, warehouse, category, items, quantities, and costs.", key="wd_reviewed")
+            if st.button("CONFIRM WAREHOUSE DELIVERY", type="primary", use_container_width=True,
+                         disabled=return_from_special or not supplier or active.empty or not confirm, key="wd_confirm"):
+                try:
+                    delivery_no = _next_warehouse_delivery_no()
+                    headers = _sb_insert("warehouse_delivery_headers", [{
+                        "delivery_no": delivery_no, "warehouse_id": warehouse_id, "category": category,
+                        "supplier": supplier, "delivery_date": delivery_date.isoformat(),
+                        "dr_invoice_no": dr_invoice or None, "remarks": remarks or None,
+                        "status": "DRAFT", "created_by": current_user
+                    }])
+                    if not headers:
+                        raise RuntimeError("The delivery header was not created.")
+                    delivery_id = headers[0]["id"]
+                    lines = [{
+                        "delivery_id": delivery_id, "item_id": row["Item ID"],
+                        "quantity": float(row["Quantity"]), "unit_cost": float(row["Unit Cost"])
+                    } for _, row in active.iterrows()]
+                    _sb_insert("warehouse_delivery_lines", lines)
+                    _warehouse_delivery_rpc("warehouse_confirm_delivery", {"p_delivery_id": delivery_id, "p_actor": current_user})
+                    log_activity(current_user, "WAREHOUSE_DELIVERY_CONFIRMED", f"{delivery_no}; {warehouse_name}; {category}")
+                    st.success(f"Delivery {delivery_no} confirmed. Inventory receiving was posted once through the TEST Supabase function.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    with tab_history:
+        st.markdown("### Delivery History")
+        try:
+            rows = _sb_request("warehouse_delivery_accounting", "GET", params={"select":"*", "order":"delivery_date.desc,delivery_id.desc", "limit":"500"})
+            if not rows:
+                st.info("No warehouse deliveries yet.")
+            else:
+                df = pd.DataFrame(rows)
+                wh_filter = st.selectbox("Warehouse Filter", ["All"] + sorted(df["warehouse"].dropna().unique().tolist()), key="wd_hist_wh")
+                cat_filter = st.selectbox("Category Filter", ["All"] + sorted(df["category"].dropna().unique().tolist()), key="wd_hist_cat")
+                view = df.copy()
+                if wh_filter != "All": view = view[view["warehouse"] == wh_filter]
+                if cat_filter != "All": view = view[view["category"] == cat_filter]
+                cols = [c for c in ["delivery_no","warehouse","category","supplier","delivery_date","dr_invoice_no","status","total_amount","amount_paid","remaining_balance","payment_status"] if c in view.columns]
+                st.dataframe(view[cols], use_container_width=True, hide_index=True)
+                st.download_button("Download Filtered History (CSV)", view[cols].to_csv(index=False).encode("utf-8"), "Warehouse_Delivery_History.csv", "text/csv", key="wd_hist_csv")
+        except Exception as exc:
+            st.error(str(exc))
+
+    with tab_accounting:
+        st.markdown("### Payment & Accounting")
+        try:
+            rows = _sb_request("warehouse_delivery_accounting", "GET", params={"select":"*", "order":"delivery_date.desc,delivery_id.desc", "limit":"500"})
+            if not rows:
+                st.info("No warehouse deliveries available for payment.")
+            else:
+                labels = [f"{r['delivery_no']} — {r['warehouse']} — {r['supplier']} — Remaining ₱{float(r.get('remaining_balance') or 0):,.2f}" for r in rows]
+                choice = st.selectbox("Delivery / Invoice", labels, key="wd_pay_delivery")
+                rec = rows[labels.index(choice)]
+                a,b,c = st.columns(3)
+                a.metric("Total", f"₱{float(rec.get('total_amount') or 0):,.2f}")
+                b.metric("Paid", f"₱{float(rec.get('amount_paid') or 0):,.2f}")
+                c.metric("Remaining", f"₱{float(rec.get('remaining_balance') or 0):,.2f}")
+                st.write(f"**Payment Status:** {rec.get('payment_status','—')}  |  **DR/Invoice:** {rec.get('dr_invoice_no') or '—'}")
+                payments = _sb_request("warehouse_delivery_payments", "GET", params={"select":"*", "delivery_id":f"eq.{rec['delivery_id']}", "order":"payment_date.desc,id.desc"})
+                if payments:
+                    st.dataframe(pd.DataFrame(payments), use_container_width=True, hide_index=True)
+                remaining = float(rec.get("remaining_balance") or 0)
+                if remaining > 0:
+                    amount = st.number_input("Payment Amount *", min_value=0.0, max_value=remaining, step=0.01, key="wd_pay_amount")
+                    pay_date = st.date_input("Payment Date *", value=date.today(), key="wd_pay_date")
+                    method = st.text_input("Payment Method", key="wd_pay_method").strip()
+                    reference = st.text_input("Reference No.", key="wd_pay_ref").strip()
+                    pay_remarks = st.text_input("Payment Remarks", key="wd_pay_remarks").strip()
+                    if st.button("RECORD PAYMENT", type="primary", disabled=amount <= 0, key="wd_record_payment"):
+                        try:
+                            _warehouse_delivery_rpc("warehouse_record_delivery_payment", {
+                                "p_delivery_id": rec["delivery_id"], "p_amount": amount,
+                                "p_payment_date": pay_date.isoformat(), "p_payment_method": method,
+                                "p_reference_no": reference, "p_remarks": pay_remarks, "p_actor": current_user
+                            })
+                            log_activity(current_user, "WAREHOUSE_PAYMENT_RECORDED", f"{rec['delivery_no']}; {amount}")
+                            st.success("Payment recorded. Inventory quantities were not changed."); st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                else:
+                    st.success("This delivery is fully paid.")
+        except Exception as exc:
+            st.error(str(exc))
+
+    with tab_files:
+        st.markdown("### Files")
+        st.caption("File records are separated from inventory and accounting. Actual document upload will be enabled after the TEST Supabase Storage bucket and policies are configured.")
+        try:
+            rows = _sb_request("warehouse_delivery_files", "GET", params={"select":"*", "order":"uploaded_at.desc", "limit":"500"})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No warehouse delivery files recorded yet.")
+        except Exception as exc:
+            st.error(str(exc))
+
 # V13.1 role-aware navigation
 from warehouse_inventory import render_warehouse_inventory
-is_admin = current_role in ("Admin", "Super Admin")
-if is_admin:
-    admin_menu=["Dashboard","Warehouse Inventory","Orders","Stock Count Requests","Delivery Receipt Generator","Receiving & Variances","Deliveries","Transaction History","User Management"]
-    if current_role == "Super Admin": admin_menu.extend(["Database Backup", "Settings"])
-    mode=st.sidebar.radio("System Menu",admin_menu)
-    if mode=="Dashboard":
-        st.markdown("## Super Admin Dashboard")
-        render_daily_brew()
+
+if current_role == "Super Admin":
+    st.sidebar.markdown("#### Operations")
+    mode = st.sidebar.radio("System Menu", [
+        "Dashboard", "Orders & Allocation", "Receiving & Variances", "Deliveries",
+        "Warehouse Inventory", "Warehouse Deliveries", "Stock Count Requests",
+        "Delivery Receipt Generator", "Transaction History", "User Management",
+        "Database Backup", "Settings"
+    ], label_visibility="collapsed")
+    if mode == "Dashboard":
+        st.markdown("## Super Admin Dashboard"); render_daily_brew()
         with db_conn() as c:
             total=c.execute("SELECT COUNT(*) FROM order_cycles").fetchone()[0]
             pending=c.execute("SELECT COUNT(*) FROM order_cycle_branches WHERE status='Pending'").fetchone()[0]
             recv=c.execute("SELECT COUNT(*) FROM deliveries_v2 WHERE status='For Receiving'").fetchone()[0]
         a,b,c1=st.columns(3); a.metric("Order Requests",total); b.metric("Pending Branch Submissions",pending); c1.metric("For Receiving",recv)
-        st.caption("Create an Order No. under Orders, select the category and branches, then send the request to staff.")
-    elif mode=="Warehouse Inventory": render_warehouse_inventory(current_user,current_role, st.session_state.get("branch", ""))
-    elif mode=="Orders": super_orders()
-    elif mode=="Stock Count Requests": stock_count_admin()
-    elif mode=="Delivery Receipt Generator": render_dr_generator()
-    elif mode=="Receiving & Variances": receiving_variances_admin()
-    elif mode=="Deliveries": deliveries_history()
-    elif mode=="Transaction History": transaction_history()
-    elif mode=="User Management": admin_panel()
-    elif mode=="Database Backup": database_backup()
-    elif mode=="Settings": branch_management()
+    elif mode == "Orders & Allocation": super_orders()
+    elif mode == "Receiving & Variances": receiving_variances_admin()
+    elif mode == "Deliveries": deliveries_history()
+    elif mode == "Warehouse Inventory": render_warehouse_inventory(current_user,current_role,st.session_state.get("branch", ""))
+    elif mode == "Warehouse Deliveries": warehouse_deliveries_admin()
+    elif mode == "Stock Count Requests": stock_count_admin()
+    elif mode == "Delivery Receipt Generator": render_dr_generator()
+    elif mode == "Transaction History": transaction_history()
+    elif mode == "User Management": admin_panel()
+    elif mode == "Database Backup": database_backup()
+    elif mode == "Settings": branch_management()
+
+elif current_role == "Admin":
+    st.sidebar.markdown("#### Warehouse Operations")
+    mode = st.sidebar.radio("Warehouse Menu", ["Dashboard", "Warehouse Inventory", "Warehouse Transaction History"], label_visibility="collapsed")
+    if mode == "Dashboard":
+        st.markdown(f"## {st.session_state.get('branch','Warehouse')} Dashboard"); render_daily_brew()
+        st.caption("This Admin account is locked to its assigned warehouse.")
+    elif mode == "Warehouse Inventory": render_warehouse_inventory(current_user,current_role,st.session_state.get("branch", ""))
+    elif mode == "Warehouse Transaction History": transaction_history()
+
 else:
-    mode=st.sidebar.radio("Branch Menu",["Dashboard","Order Requests","Stock Count","My Orders","Receive Delivery","Variances","History"])
+    st.sidebar.markdown("#### Branch Operations")
+    mode=st.sidebar.radio("Branch Menu",["Dashboard","Orders","Receiving","Stock Count Requests","Delivery / Receiving History"], label_visibility="collapsed")
     if mode=="Dashboard":
-        st.markdown(f"## {branch_for_user()} Branch Dashboard")
-        render_daily_brew()
+        st.markdown(f"## {branch_for_user()} Branch Dashboard"); render_daily_brew()
         with db_conn() as c:
             n=c.execute("SELECT COUNT(*) FROM order_cycle_branches WHERE branch=? AND status='Pending'",(branch_for_user(),)).fetchone()[0]
         if n: st.warning(f"You have {n} new order request(s) waiting for your input.")
-        st.write("Use Order Requests to enter quantities only when Super Admin sends an order request to your branch.")
-    elif mode=="Order Requests": staff_orders()
-    elif mode=="Stock Count": stock_count_staff()
-    elif mode=="My Orders": my_orders()
-    elif mode=="Receive Delivery": receive_delivery()
-    elif mode=="Variances": transaction_history()
-    elif mode=="History": transaction_history()
-
+    elif mode=="Orders":
+        order_tab1, order_tab2 = st.tabs(["Order Requests", "My Orders"])
+        with order_tab1: staff_orders()
+        with order_tab2: my_orders()
+    elif mode=="Receiving": receive_delivery()
+    elif mode=="Stock Count Requests": stock_count_staff()
+    elif mode=="Delivery / Receiving History": transaction_history()
