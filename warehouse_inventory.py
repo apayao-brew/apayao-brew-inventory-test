@@ -226,21 +226,54 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
 
     with tabs[3]:
         st.subheader(f'Item Masterlist — {warehouse_name} / {category}')
-        name=st.text_input('Item name',key='wh_new_item_v2')
-        unit=st.selectbox('Unit',['pcs','packs','boxes','bottles','kg','g','L','mL'],key='wh_new_unit_v2')
-        if st.button('ADD ITEM',disabled=not name.strip(),key='wh_add_item_v2'):
-            try:
-                _request('warehouse_items','POST',data={
-                    'warehouse_id':warehouse_id,
-                    'category':category,
-                    'name':name.strip(),
-                    'unit':unit,
-                    'active':True
-                })
-                st.success(f'Item added to {warehouse_name}.'); st.rerun()
-            except Exception as exc: st.error(str(exc))
+        if role == 'Super Admin':
+            master_mode = st.radio('Masterlist method', ['Manual Add','Excel Upload'], horizontal=True, key='wh_master_mode_v3')
+            allowed_units=['pcs','packs','boxes','bottles','kg','g','L','mL']
+            if master_mode == 'Manual Add':
+                name=st.text_input('Item name',key='wh_new_item_v3')
+                unit=st.selectbox('Unit',allowed_units,key='wh_new_unit_v3')
+                if st.button('ADD ITEM',disabled=not name.strip(),key='wh_add_item_v3'):
+                    try:
+                        existing={str(r['name']).strip().casefold() for r in items}
+                        if name.strip().casefold() in existing:
+                            raise ValueError('This item already exists in the selected warehouse/category.')
+                        _request('warehouse_items','POST',data={'warehouse_id':warehouse_id,'category':category,'name':name.strip(),'unit':unit,'active':True})
+                        st.success(f'Item added to {warehouse_name} / {category}.'); st.rerun()
+                    except Exception as exc: st.error(str(exc))
+            else:
+                template=pd.DataFrame({'Item Name':['Example Item'],'Unit':['pcs']})
+                buf=io.BytesIO()
+                with pd.ExcelWriter(buf,engine='openpyxl') as writer: template.to_excel(writer,index=False,sheet_name='Item Masterlist')
+                st.download_button('Download Excel Template',buf.getvalue(),f'{warehouse_name}_{category}_Item_Masterlist.xlsx',key='wh_master_template_v3')
+                upload=st.file_uploader('Upload Item Masterlist Excel',type=['xlsx'],key='wh_master_upload_v3')
+                if upload:
+                    try:
+                        frame=pd.read_excel(upload).dropna(how='all').copy()
+                        required={'Item Name','Unit'}
+                        if not required.issubset(frame.columns): raise ValueError('Required columns: Item Name, Unit.')
+                        frame=frame[['Item Name','Unit']]
+                        frame['Item Name']=frame['Item Name'].fillna('').astype(str).str.strip()
+                        frame['Unit']=frame['Unit'].fillna('').astype(str).str.strip()
+                        if frame.empty or (frame['Item Name']=='').any(): raise ValueError('Blank Item Name is not allowed.')
+                        invalid=frame[~frame['Unit'].isin(allowed_units)]
+                        if not invalid.empty: raise ValueError('Invalid Unit found. Allowed: '+', '.join(allowed_units))
+                        dup=frame[frame['Item Name'].str.casefold().duplicated(keep=False)]
+                        if not dup.empty: raise ValueError('Duplicate Item Name found in the uploaded Excel.')
+                        existing={str(r['name']).strip().casefold() for r in items}
+                        frame['Status']=frame['Item Name'].apply(lambda x:'Already Exists' if x.casefold() in existing else 'Ready')
+                        st.dataframe(frame,hide_index=True,use_container_width=True)
+                        ready=frame[frame['Status']=='Ready']
+                        if st.button('SAVE ITEM MASTERLIST',type='primary',disabled=ready.empty,key='wh_master_save_v3'):
+                            payload=[{'warehouse_id':warehouse_id,'category':category,'name':r['Item Name'],'unit':r['Unit'],'active':True} for _,r in ready.iterrows()]
+                            _request('warehouse_items','POST',data=payload)
+                            st.success(f'{len(payload)} item(s) added to {warehouse_name} / {category}.'); st.rerun()
+                    except Exception as exc: st.error(str(exc))
+        else:
+            st.info('View only. Only Super Admin can add or upload Warehouse Item Masterlist items.')
         if items:
-            st.dataframe(pd.DataFrame(items)[['name','unit']],hide_index=True,use_container_width=True)
+            st.dataframe(pd.DataFrame(items)[['name','unit']].rename(columns={'name':'Item Name','unit':'Unit'}),hide_index=True,use_container_width=True)
+        else:
+            st.info('No items yet for this warehouse/category.')
 
     with tabs[4]:
         st.subheader(f'Dispatch History — {warehouse_name}')
