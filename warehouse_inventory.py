@@ -333,60 +333,158 @@ def render_warehouse_inventory(username, role, assigned_warehouse=""):
                 reserved_lookup = {str(r['item_id']): float(r.get('reserved_quantity') or 0) for r in reserved_rows}
                 balance_lookup = {str(r['item_id']): float(r.get('balance') or 0) for r in balances}
 
-                dispatch_rows = []
-                for item in items:
-                    item_id = str(item['id'])
-                    balance_qty = balance_lookup.get(item_id, 0.0)
-                    reserved_qty = reserved_lookup.get(item_id, 0.0)
-                    dispatch_rows.append({
-                        'Item ID': item_id,
-                        'Item': item['name'],
-                        'Unit': item['unit'],
-                        'Warehouse Stock': balance_qty,
-                        'Reserved / In Transit': reserved_qty,
-                        'Available to Dispatch': balance_qty - reserved_qty,
-                        'Qty to Dispatch': 0.0,
-                    })
+                item_by_name = {i['name']: i for i in items}
+                mode_manual, mode_excel = st.tabs(['Manual Selection', 'Upload Allocation Excel'])
 
-                branch = st.text_input('Branch', key='wh_direct_branch')
-                reference = st.text_input('Reference / DR No. (optional)', key='wh_direct_reference')
-                remarks = st.text_area('Remarks (optional)', key='wh_direct_remarks')
+                with mode_manual:
+                    selected_names = st.multiselect(
+                        'Select Item(s) to Dispatch',
+                        options=list(item_by_name.keys()),
+                        placeholder='Choose only the items you want to dispatch',
+                        key='wh_direct_selected_items'
+                    )
+                    branch = st.text_input('Branch', key='wh_direct_branch')
+                    reference = st.text_input('Reference / DR No. (optional)', key='wh_direct_reference')
+                    remarks = st.text_area('Remarks (optional)', key='wh_direct_remarks')
+                    selected = pd.DataFrame()
+                    invalid_qty = False
 
-                edited_dispatch = st.data_editor(
-                    pd.DataFrame(dispatch_rows),
-                    hide_index=True,
-                    use_container_width=True,
-                    disabled=['Item ID','Item','Unit','Warehouse Stock','Reserved / In Transit','Available to Dispatch'],
-                    column_config={'Qty to Dispatch': st.column_config.NumberColumn('Qty to Dispatch', min_value=0.0, step=1.0, format='%.3f')},
-                    key='wh_direct_editor'
-                )
+                    if selected_names:
+                        dispatch_rows = []
+                        for item_name in selected_names:
+                            item = item_by_name[item_name]
+                            item_id = str(item['id'])
+                            available = balance_lookup.get(item_id, 0.0) - reserved_lookup.get(item_id, 0.0)
+                            dispatch_rows.append({
+                                'Item ID': item_id, 'Item': item['name'], 'Unit': item['unit'],
+                                'Available Stock': available, 'Qty to Dispatch': 0.0
+                            })
+                        st.markdown('#### Selected Items')
+                        edited_dispatch = st.data_editor(
+                            pd.DataFrame(dispatch_rows), hide_index=True, use_container_width=True,
+                            disabled=['Item ID','Item','Unit','Available Stock'],
+                            column_config={'Qty to Dispatch': st.column_config.NumberColumn(
+                                'Qty to Dispatch', min_value=0.0, step=1.0, format='%.3f')},
+                            key='wh_direct_editor'
+                        )
+                        selected = edited_dispatch[pd.to_numeric(
+                            edited_dispatch['Qty to Dispatch'], errors='coerce').fillna(0) > 0].copy()
+                        invalid_qty = any(
+                            float(r['Qty to Dispatch']) > float(r['Available Stock'])
+                            for _, r in selected.iterrows()
+                        ) if not selected.empty else False
+                        if invalid_qty:
+                            st.error('A dispatch quantity is greater than the available stock.')
+                    else:
+                        st.info('Select only the items you want to include. Unselected items are not part of the dispatch.')
 
-                selected = edited_dispatch[pd.to_numeric(edited_dispatch['Qty to Dispatch'], errors='coerce').fillna(0) > 0].copy()
-                invalid_qty = any(
-                    float(r['Qty to Dispatch']) > float(r['Available to Dispatch'])
-                    for _, r in selected.iterrows()
-                ) if not selected.empty else False
+                    if st.button('CREATE DIRECT DISPATCH', type='primary',
+                                 disabled=(not str(branch).strip() or not selected_names or selected.empty or invalid_qty),
+                                 key='wh_direct_create'):
+                        dispatch_no = 'DD-' + datetime.now(TZ).strftime('%Y%m%d-%H%M%S-%f')
+                        _rpc('warehouse_create_direct_dispatch', {
+                            'p_dispatch_no': dispatch_no, 'p_warehouse_id': warehouse_id,
+                            'p_branch': str(branch).strip(), 'p_category': category,
+                            'p_reference': str(reference).strip(), 'p_remarks': str(remarks).strip(),
+                            'p_rows': [{'item_id': str(r['Item ID']), 'qty': float(r['Qty to Dispatch'])}
+                                       for _, r in selected.iterrows()],
+                            'p_actor': username
+                        })
+                        st.success(f'Direct Dispatch {dispatch_no} created FOR PREPARATION.')
+                        st.rerun()
 
-                if invalid_qty:
-                    st.error('A dispatch quantity is greater than the available stock after reservations.')
+                with mode_excel:
+                    st.caption('Upload one allocation file for multiple branches. Uploading does not deduct or reserve stock until you confirm the allocation.')
+                    template = pd.DataFrame([
+                        {'Branch':'TEST BRANCH','Item Name':items[0]['name'],'Qty to Dispatch':10}
+                    ])
+                    template_buf = io.BytesIO()
+                    with pd.ExcelWriter(template_buf, engine='openpyxl') as writer:
+                        template.to_excel(writer, index=False, sheet_name='Direct Dispatch Allocation')
+                    st.download_button(
+                        'DOWNLOAD EXCEL TEMPLATE',
+                        data=template_buf.getvalue(),
+                        file_name=f'{warehouse_name}_{category}_Direct_Dispatch_Template.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        key='wh_direct_template'
+                    )
 
-                if st.button('CREATE DIRECT DISPATCH', type='primary',
-                             disabled=(not str(branch).strip() or selected.empty or invalid_qty),
-                             key='wh_direct_create'):
-                    dispatch_no = 'DD-' + datetime.now(TZ).strftime('%Y%m%d-%H%M%S-%f')
-                    rows_payload = [{'item_id': str(r['Item ID']), 'qty': float(r['Qty to Dispatch'])} for _, r in selected.iterrows()]
-                    _rpc('warehouse_create_direct_dispatch', {
-                        'p_dispatch_no': dispatch_no,
-                        'p_warehouse_id': warehouse_id,
-                        'p_branch': str(branch).strip(),
-                        'p_category': category,
-                        'p_reference': str(reference).strip(),
-                        'p_remarks': str(remarks).strip(),
-                        'p_rows': rows_payload,
-                        'p_actor': username
-                    })
-                    st.success(f'Direct Dispatch {dispatch_no} created FOR PREPARATION.')
-                    st.rerun()
+                    uploaded = st.file_uploader(
+                        'Upload Allocation Excel',
+                        type=['xlsx'],
+                        key='wh_direct_excel'
+                    )
+                    if uploaded is not None:
+                        try:
+                            allocation = pd.read_excel(uploaded)
+                            required = ['Branch','Item Name','Qty to Dispatch']
+                            missing = [c for c in required if c not in allocation.columns]
+                            if missing:
+                                st.error('Missing column(s): ' + ', '.join(missing))
+                            else:
+                                allocation = allocation[required].copy()
+                                allocation['Branch'] = allocation['Branch'].fillna('').astype(str).str.strip()
+                                allocation['Item Name'] = allocation['Item Name'].fillna('').astype(str).str.strip()
+                                allocation['Qty to Dispatch'] = pd.to_numeric(allocation['Qty to Dispatch'], errors='coerce')
+
+                                allocation['Status'] = 'OK'
+                                allocation.loc[allocation['Branch'].eq(''), 'Status'] = 'Missing Branch'
+                                allocation.loc[allocation['Item Name'].eq(''), 'Status'] = 'Missing Item'
+                                allocation.loc[allocation['Qty to Dispatch'].isna() | (allocation['Qty to Dispatch'] <= 0), 'Status'] = 'Invalid Qty'
+                                allocation.loc[~allocation['Item Name'].isin(item_by_name.keys()), 'Status'] = 'Unknown Item'
+
+                                dup = allocation.duplicated(['Branch','Item Name'], keep=False)
+                                allocation.loc[dup & allocation['Status'].eq('OK'), 'Status'] = 'Duplicate Branch + Item'
+
+                                valid_mask = allocation['Status'].eq('OK')
+                                requested_by_item = allocation[valid_mask].groupby('Item Name')['Qty to Dispatch'].sum().to_dict()
+                                for item_name, requested_qty in requested_by_item.items():
+                                    item = item_by_name[item_name]
+                                    item_id = str(item['id'])
+                                    available = balance_lookup.get(item_id, 0.0) - reserved_lookup.get(item_id, 0.0)
+                                    if float(requested_qty) > float(available):
+                                        allocation.loc[
+                                            allocation['Item Name'].eq(item_name) & allocation['Status'].eq('OK'),
+                                            'Status'
+                                        ] = f'Insufficient Stock (Available {available:g})'
+
+                                st.markdown('#### Allocation Preview')
+                                st.dataframe(allocation, hide_index=True, use_container_width=True)
+
+                                has_errors = not allocation['Status'].eq('OK').all()
+                                if has_errors:
+                                    st.error('Fix the rows marked above before confirming the allocation.')
+                                else:
+                                    st.success('Allocation is valid. Nothing has been dispatched yet.')
+                                    excel_reference = st.text_input(
+                                        'Reference / Batch No. (optional)',
+                                        key='wh_direct_excel_reference'
+                                    )
+                                    if st.button('CONFIRM EXCEL ALLOCATION', type='primary', key='wh_direct_excel_confirm'):
+                                        batch_stamp = datetime.now(TZ).strftime('%Y%m%d-%H%M%S-%f')
+                                        for branch_name, branch_rows in allocation.groupby('Branch', sort=False):
+                                            payload = []
+                                            for _, row in branch_rows.iterrows():
+                                                item = item_by_name[row['Item Name']]
+                                                payload.append({
+                                                    'item_id': str(item['id']),
+                                                    'qty': float(row['Qty to Dispatch'])
+                                                })
+                                            dispatch_no = f'DD-{batch_stamp}-{len(payload)}-{abs(hash(branch_name)) % 10000:04d}'
+                                            _rpc('warehouse_create_direct_dispatch', {
+                                                'p_dispatch_no': dispatch_no,
+                                                'p_warehouse_id': warehouse_id,
+                                                'p_branch': branch_name,
+                                                'p_category': category,
+                                                'p_reference': str(excel_reference).strip(),
+                                                'p_remarks': 'Created from Direct Dispatch Excel allocation',
+                                                'p_rows': payload,
+                                                'p_actor': username
+                                            })
+                                        st.success('Excel allocation created FOR PREPARATION. Branch allocations are now saved separately.')
+                                        st.rerun()
+                        except Exception as exc:
+                            st.error(f'Could not read allocation file: {exc}')
 
                 st.markdown('#### For Preparation / In Transit')
                 active_dispatches = _request('warehouse_direct_dispatches', params={
