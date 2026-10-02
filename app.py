@@ -2876,11 +2876,12 @@ def direct_dispatch_dr_generator():
         "Category": x.get("category"),
         "Status": x.get("status"),
         "Allocation Confirmation": x.get("allocation_confirmation") or "Pending",
-        "DR No.": x.get("dr_no") or "Not Generated"
+        "DR No.": x.get("dr_no") or "Not Generated",
+        "PDF": "Saved" if x.get("dr_pdf_base64") else "Missing"
     } for x in br]), use_container_width=True, hide_index=True)
 
     confirmed = [x for x in br if str(x.get("allocation_confirmation") or "").strip().upper() == "CONFIRMED"]
-    waiting = [x for x in confirmed if not x.get("dr_no")]
+    waiting = [x for x in confirmed if not x.get("dr_no") or not x.get("dr_pdf_base64")]
 
     if not confirmed:
         st.warning("No branch in this batch has confirmed its allocation yet.")
@@ -2990,7 +2991,7 @@ def direct_dispatch_dr_generator():
     # Release remains batch-based. It appears only after every dispatch in the
     # batch that needs receiving has a DR number.
     refreshed = [x for x in br]
-    all_confirmed_have_dr = bool(confirmed) and all(x.get("dr_no") for x in confirmed)
+    all_confirmed_have_dr = bool(confirmed) and all(x.get("dr_no") and x.get("dr_pdf_base64") for x in confirmed)
     pending_unconfirmed = [x for x in br if str(x.get("allocation_confirmation") or "").strip().upper() != "CONFIRMED"]
     if all_confirmed_have_dr and not pending_unconfirmed:
         if st.button("RELEASE BATCH FOR RECEIVING", type="primary", use_container_width=True, key=f"dd_release_recv_{batch}"):
