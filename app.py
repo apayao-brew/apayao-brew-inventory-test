@@ -2152,10 +2152,12 @@ def receive_direct_dispatch():
     try:
         dispatches=_sb_request("warehouse_direct_dispatches","GET",params={
             "select":"id,dispatch_no,warehouse_id,branch,category,source,reference,remarks,status,released_at",
-            "branch":f"eq.{branch}",
             "status":"eq.IN_TRANSIT",
             "order":"released_at.desc"
         })
+        # Branch names from Direct Dispatch may be stored in uppercase (e.g. BUNTUN)
+        # while the branch account may be "Buntun". Match case-insensitively.
+        dispatches=[d for d in dispatches if str(d.get("branch","")).strip().casefold()==str(branch).strip().casefold()]
     except Exception as exc:
         st.error(f"Could not load Direct Dispatch receiving: {exc}")
         return
