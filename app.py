@@ -3371,6 +3371,13 @@ elif current_role == "Admin":
 
 else:
     st.sidebar.markdown("#### Branch Operations")
+    def _branch_nav(target_mode, target_key=None, target_value=None):
+        # Streamlit callbacks run before the next script render, so it is safe
+        # to change the sidebar radio state here.
+        if target_key is not None:
+            st.session_state[target_key]=target_value
+        st.session_state["branch_menu_mode"]=target_mode
+
     mode=st.sidebar.radio("Branch Menu",["Dashboard","Orders","Receiving","Stock Count Requests","Delivery / Receiving History"], label_visibility="collapsed", key="branch_menu_mode")
     if mode=="Dashboard":
         st.markdown(f"## {branch_for_user()} Branch Dashboard"); render_daily_brew()
@@ -3403,9 +3410,6 @@ else:
         except Exception:
             pending_stock_counts = []
 
-        if pending_allocations or pending_stock_counts:
-            st.markdown("### 🔔 Pending Actions")
-
         # Direct Dispatch pending actions for this branch.
         try:
             _dd_pending=_sb_request("warehouse_direct_dispatches","GET",params={
@@ -3418,37 +3422,52 @@ else:
         except Exception:
             _dd_pending=[]
 
-        for _dd in _dd_pending:
-            _akey=f"direct_alloc_confirmed_{_dd['id']}"
-            if not st.session_state.get(_akey,False):
-                st.warning(f"Allocation Confirmation Pending • {_dd['dispatch_no']} • {_dd['category']}")
-                if st.button("Review Direct Dispatch Allocation",
-                             key=f"dash_direct_alloc_{_dd['id']}",use_container_width=True):
-                    st.session_state["open_direct_dispatch_id"]=int(_dd["id"])
-                    st.session_state["branch_menu_mode"]="Receiving"
-                    st.rerun()
-            else:
-                st.warning(f"Receiving Pending • {_dd['dispatch_no']} • {_dd['category']}")
-                if st.button("Input Direct Dispatch Receiving",
-                             key=f"dash_direct_recv_{_dd['id']}",use_container_width=True):
-                    st.session_state["open_direct_dispatch_id"]=int(_dd["id"])
-                    st.session_state["branch_menu_mode"]="Receiving"
-                    st.rerun()
+        if pending_allocations or pending_stock_counts or _dd_pending:
+            st.markdown("### 🔔 Pending Actions")
+
+            for _dd in _dd_pending:
+                _akey=f"direct_alloc_confirmed_{_dd['id']}"
+                if not st.session_state.get(_akey,False):
+                    st.warning(f"Allocation Confirmation Pending • {_dd['dispatch_no']} • {_dd['category']}")
+                    st.button(
+                        "Review Direct Dispatch Allocation",
+                        key=f"dash_direct_alloc_{_dd['id']}",
+                        use_container_width=True,
+                        on_click=_branch_nav,
+                        args=("Receiving","open_direct_dispatch_id",int(_dd["id"]))
+                    )
+                else:
+                    st.warning(f"Receiving Pending • {_dd['dispatch_no']} • {_dd['category']}")
+                    st.button(
+                        "Input Direct Dispatch Receiving",
+                        key=f"dash_direct_recv_{_dd['id']}",
+                        use_container_width=True,
+                        on_click=_branch_nav,
+                        args=("Receiving","open_direct_dispatch_id",int(_dd["id"]))
+                    )
+
             for cb_id, order_no, category in pending_allocations:
                 c1,c2=st.columns([4,1])
                 c1.warning(f"Allocation waiting for approval — {order_no} • {category}")
-                if c2.button("Review Allocation",key=f"dash_alloc_{cb_id}",use_container_width=True):
-                    st.session_state["open_allocation_cycle_branch_id"]=int(cb_id)
-                    st.session_state["branch_menu_mode"]="Orders"
-                    st.rerun()
+                c2.button(
+                    "Review Allocation",
+                    key=f"dash_alloc_{cb_id}",
+                    use_container_width=True,
+                    on_click=_branch_nav,
+                    args=("Orders","open_allocation_cycle_branch_id",int(cb_id))
+                )
+
             for br_row, req_row in pending_stock_counts:
                 rid=req_row.get("id")
                 c1,c2=st.columns([4,1])
                 c1.warning(f"Stock Count required — {req_row.get('request_no','Request')} • {req_row.get('category','')}")
-                if c2.button("Input Stock Count",key=f"dash_stock_{rid}",use_container_width=True):
-                    st.session_state["open_stock_count_request_id"]=rid
-                    st.session_state["branch_menu_mode"]="Stock Count Requests"
-                    st.rerun()
+                c2.button(
+                    "Input Stock Count",
+                    key=f"dash_stock_{rid}",
+                    use_container_width=True,
+                    on_click=_branch_nav,
+                    args=("Stock Count Requests","open_stock_count_request_id",rid)
+                )
         else:
             st.success("✓ No pending actions.")
 
